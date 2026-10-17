@@ -1,4 +1,4 @@
-// Exo Capture - sound: the game, Discord and the microphone as separate tracks plus their mix, as AAC.
+// Exo Capture - sound: the mix of the game, Discord and the microphone, then each on its own track, as AAC.
 // GPL-3.0-or-later.
 #include "audio.h"
 
@@ -56,7 +56,8 @@ struct ActivateHandler : winrt::implements<ActivateHandler, IActivateAudioInterf
 class AudioSource
 {
 public:
-    enum class Kind { System, ProcessInclude, ProcessExclude, Microphone };
+    /// Discord: Discord's process tree, looked for again while it is not running (or after it closed).
+    enum class Kind { System, ProcessInclude, ProcessExclude, Discord, Microphone };
 
     AudioSource(Kind kind, DWORD pid, int64_t origin) : m_kind(kind), m_pid(pid), m_origin(origin), m_ring(RingFrames * 2)
     {
@@ -92,13 +93,19 @@ private:
         auto format = Pcm48();
         com_ptr<IAudioClient> client;
         DWORD flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
-        if (m_kind == Kind::ProcessInclude || m_kind == Kind::ProcessExclude)
+        if (m_kind == Kind::Discord)
+        {
+            m_pid = FindDiscord();
+            if (!m_pid) throw Failure(S_FALSE, "Discord is not running");
+            m_process = winrt::handle(OpenProcess(SYNCHRONIZE, FALSE, m_pid));
+        }
+        if (m_kind != Kind::System && m_kind != Kind::Microphone)
         {
             AUDIOCLIENT_ACTIVATION_PARAMS params{};
             params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
             params.ProcessLoopbackParams.TargetProcessId = m_pid;
-            params.ProcessLoopbackParams.ProcessLoopbackMode = m_kind == Kind::ProcessInclude
-                ? PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE : PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
+            params.ProcessLoopbackParams.ProcessLoopbackMode = m_kind == Kind::ProcessExclude
+                ? PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE : PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
             PROPVARIANT value{};
             value.vt = VT_BLOB;
             value.blob.cbSize = sizeof(params);
@@ -143,6 +150,8 @@ private:
                 while (!m_stop)
                 {
                     WaitForSingleObject(ready, 20);
+                    // Discord closed (an update restarts it): find the new one.
+                    if (m_process && WaitForSingleObject(m_process.get(), 0) == WAIT_OBJECT_0) throw Failure(S_FALSE, "Discord closed");
                     UINT32 packet = 0;
                     Check(capture->GetNextPacketSize(&packet), "sound read");
                     while (packet > 0)
@@ -162,10 +171,11 @@ private:
             }
             catch (const std::exception& e)
             {
-                // A device unplugged or switched: try again shortly.
+                // No microphone or Discord yet, or a device unplugged or switched: the track stays
+                // silent and this tries again shortly (Discord less often: finding it walks every process).
                 if (!m_failedOnce) Log(std::string("Sound source: ") + e.what());
                 m_failedOnce = true;
-                for (int i = 0; i < 20 && !m_stop; ++i) Sleep(50);
+                for (int i = 0; i < (m_kind == Kind::Discord ? 100 : 20) && !m_stop; ++i) Sleep(50);
             }
         }
         CloseHandle(ready);
@@ -197,6 +207,7 @@ private:
 
     Kind m_kind;
     DWORD m_pid;
+    winrt::handle m_process; // Discord, to notice it closed
     int64_t m_origin;
     std::mutex m_lock;
     std::vector<int16_t> m_ring;
@@ -317,32 +328,18 @@ private:
 AudioCapture::AudioCapture(const Options& options, std::function<void(PacketPtr)> sink)
 {
     m_origin = Now100ns();
-    if (options.game)
-    {
-        if (options.gamePid)
-            m_sources.push_back(std::make_unique<AudioSource>(AudioSource::Kind::ProcessInclude, options.gamePid, m_origin));
-        else if (options.discordPid)
-            m_sources.push_back(std::make_unique<AudioSource>(AudioSource::Kind::ProcessExclude, options.discordPid, m_origin));
-        else
-            m_sources.push_back(std::make_unique<AudioSource>(AudioSource::Kind::System, 0, m_origin));
-    }
-    if (options.discord && options.discordPid)
-        m_sources.push_back(std::make_unique<AudioSource>(AudioSource::Kind::ProcessInclude, options.discordPid, m_origin));
-    if (options.mic)
-        m_sources.push_back(std::make_unique<AudioSource>(AudioSource::Kind::Microphone, 0, m_origin));
-    if (m_sources.empty()) return;
+    if (options.gamePid)
+        m_sources.push_back(std::make_unique<AudioSource>(AudioSource::Kind::ProcessInclude, options.gamePid, m_origin));
+    else if (options.discordPid)
+        m_sources.push_back(std::make_unique<AudioSource>(AudioSource::Kind::ProcessExclude, options.discordPid, m_origin));
+    else
+        m_sources.push_back(std::make_unique<AudioSource>(AudioSource::Kind::System, 0, m_origin));
+    m_sources.push_back(std::make_unique<AudioSource>(AudioSource::Kind::Discord, 0, m_origin));
+    m_sources.push_back(std::make_unique<AudioSource>(AudioSource::Kind::Microphone, 0, m_origin));
 
-    // Track 1 is what players play: the mix. The sources follow on their own
-    // tracks for editing.
-    int track = 1;
-    if (m_sources.size() > 1)
-    {
-        m_mixTrack = true;
-        m_encoders.push_back(std::make_unique<AacEncoder>(track++, sink));
-        if (options.separate)
-            for (size_t i = 0; i < m_sources.size(); ++i) m_encoders.push_back(std::make_unique<AacEncoder>(track++, sink));
-    }
-    else m_encoders.push_back(std::make_unique<AacEncoder>(track++, sink));
+    // Track 1 is what players play: the mix. Each source follows on its own track, to mute in an editor.
+    for (int track = 1; track <= static_cast<int>(m_sources.size()) + 1; ++track)
+        m_encoders.push_back(std::make_unique<AacEncoder>(track, sink));
     m_thread = std::thread([this] { Mix(); });
 }
 
@@ -376,19 +373,14 @@ void AudioCapture::Mix()
             int64_t time = m_origin + position * 10'000'000 / Rate;
             try
             {
-                size_t encoder = 0;
-                if (m_mixTrack)
+                for (int i = 0; i < Block * 2; ++i)
                 {
-                    for (int i = 0; i < Block * 2; ++i)
-                    {
-                        int sum = 0;
-                        for (auto& b : blocks) sum += b[i];
-                        mix[i] = static_cast<int16_t>(std::clamp(sum, -32768, 32767));
-                    }
-                    m_encoders[encoder++]->Encode(mix.data(), Block, time);
+                    int sum = 0;
+                    for (auto& b : blocks) sum += b[i];
+                    mix[i] = static_cast<int16_t>(std::clamp(sum, -32768, 32767));
                 }
-                for (size_t s = 0; s < m_sources.size() && encoder < m_encoders.size(); ++s)
-                    m_encoders[encoder++]->Encode(blocks[s].data(), Block, time);
+                m_encoders[0]->Encode(mix.data(), Block, time);
+                for (size_t s = 0; s < m_sources.size(); ++s) m_encoders[s + 1]->Encode(blocks[s].data(), Block, time);
             }
             catch (const std::exception& e) { Log(std::string("Sound encode: ") + e.what()); }
             position += Block;

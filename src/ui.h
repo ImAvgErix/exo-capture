@@ -1,5 +1,5 @@
-// Exo Capture - its own small windows: hotkeys, the "Clip saved" toast, the snip overlay and the
-// snip's preview card. Each is a separate top-level window; nothing is ever drawn into a game.
+// Exo Capture - its own small windows: hotkeys, the "Clip saved" toast and the snip overlay. Each is a
+// separate top-level window; nothing is ever drawn into a game.
 // GPL-3.0-or-later.
 #pragma once
 #include "common.h"
@@ -40,8 +40,6 @@ public:
     void Toast(const std::wstring& title, const std::wstring& detail, HMONITOR monitor, bool good = true);
     /// Dims the screen; drag a rectangle, click a window, or Enter for the whole screen. done() gets nothing on Escape.
     void Snip(std::function<void(std::optional<SnipResult>)> done);
-    /// The snip's card at the bottom right: Copy, Save, Edit, Discord, Folder.
-    void Preview(const std::wstring& path, const SnipResult& snip, std::function<void(const std::wstring& action)> onAction);
 
     HWND Window() const { return m_message; }
     struct Impl;

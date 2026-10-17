@@ -1,10 +1,10 @@
-// Exo Capture - hotkeys, the toast, the snip overlay and the preview card. GPL-3.0-or-later.
+// Exo Capture - hotkeys, the toast and the snip overlay. GPL-3.0-or-later.
 #include "ui.h"
+#include "video.h"
 
 #include <d2d1_1.h>
 #include <dwrite_3.h>
 #include <dwmapi.h>
-#include <shobjidl.h>
 #include <windowsx.h>
 
 #include <algorithm>
@@ -18,7 +18,6 @@ const D2D1_COLOR_F Black = { 0, 0, 0, 1 };
 const D2D1_COLOR_F Ink = { 0xee / 255.f, 0xee / 255.f, 0xee / 255.f, 1 };
 const D2D1_COLOR_F Muted = { 0x99 / 255.f, 0x99 / 255.f, 0x99 / 255.f, 1 };
 const D2D1_COLOR_F Hairline = { 0x24 / 255.f, 0x24 / 255.f, 0x24 / 255.f, 1 };
-const D2D1_COLOR_F HoverFill = { 0x14 / 255.f, 0x14 / 255.f, 0x14 / 255.f, 1 };
 const D2D1_COLOR_F Good = { 0x3d / 255.f, 0xd6 / 255.f, 0x8c / 255.f, 1 };
 const D2D1_COLOR_F Bad = { 0xff / 255.f, 0x5c / 255.f, 0x5c / 255.f, 1 };
 
@@ -83,10 +82,9 @@ struct Ui::Impl
 {
     com_ptr<ID2D1Factory> d2d;
     com_ptr<IDWriteFactory> dwrite;
-    com_ptr<IDWriteFontCollection> fonts; // Geist, when Exo passed its font
+    com_ptr<IDWriteFontCollection> fonts; // Inter, when Exo passed its font
     std::wstring family = L"Segoe UI Variable Text";
     Win* toast = nullptr;
-    Win* card = nullptr;
     Win* snip = nullptr;
     std::map<int, Hotkey> hotkeys;
 
@@ -133,10 +131,10 @@ struct Ui::Impl
             Check(factory->CreateFontCollectionFromFontSet(set.get(), collection.put()), "font collection");
             UINT32 index = 0;
             BOOL exists = FALSE;
-            collection->FindFamilyName(L"Geist", &index, &exists);
+            collection->FindFamilyName(L"Inter Variable", &index, &exists);
             if (!exists) return;
             fonts = collection;
-            family = L"Geist";
+            family = L"Inter Variable";
         }
         catch (const std::exception& e) { Log(std::string("Font: ") + e.what()); }
     }
@@ -236,178 +234,6 @@ struct ToastWin : Win
             return 0;
         }
         return DefWindowProcW(hwnd, msg, wp, lp);
-    }
-};
-
-// ---------------------------------------------------------------- preview card
-
-struct CardWin : Win
-{
-    Ui::Impl* ui;
-    std::wstring path;
-    std::vector<uint8_t> pixels;
-    UINT pw, ph;
-    float scale;
-    std::function<void(const std::wstring&)> onAction;
-    com_ptr<ID2D1HwndRenderTarget> target;
-    com_ptr<ID2D1Bitmap> bitmap;
-    int hover = -1;
-    bool tracking = false;
-    std::wstring flash; // "Copied" after Copy
-    int flashIndex = -1;
-    static constexpr const wchar_t* Labels[5] = { L"Copy", L"Save", L"Edit", L"Discord", L"Folder" };
-    static constexpr const wchar_t* Actions[5] = { L"copy", L"save", L"edit", L"discord", L"folder" };
-    static constexpr float Width = 344, Pad = 8, Row = 34;
-
-    float ThumbHeight() const { return std::clamp((Width - 2 * Pad) * ph / std::max<UINT>(pw, 1), 80.f, 200.f); }
-    float Height() const { return Pad + ThumbHeight() + Pad + Row + Pad; }
-    D2D1_RECT_F Button(int i) const
-    {
-        float w = (Width - 2 * Pad) / 5;
-        float top = Pad + ThumbHeight() + Pad;
-        return D2D1::RectF(Pad + i * w, top, Pad + (i + 1) * w, top + Row);
-    }
-    int HitTest(LPARAM lp) const
-    {
-        float x = GET_X_LPARAM(lp) / scale, y = GET_Y_LPARAM(lp) / scale;
-        for (int i = 0; i < 5; ++i)
-        {
-            auto r = Button(i);
-            if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return i;
-        }
-        return -1;
-    }
-    void Restart() { SetTimer(hwnd, 1, 7000, nullptr); }
-
-    LRESULT Handle(UINT msg, WPARAM wp, LPARAM lp) override
-    {
-        switch (msg)
-        {
-        case WM_PAINT:
-        {
-            PAINTSTRUCT ps;
-            BeginPaint(hwnd, &ps);
-            if (!target) { target = ui->Target(hwnd, scale); bitmap = nullptr; }
-            if (target)
-            {
-                if (!bitmap && !pixels.empty())
-                    target->CreateBitmap(D2D1::SizeU(pw, ph), pixels.data(), pw * 4,
-                        D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE)), bitmap.put());
-                target->BeginDraw();
-                target->Clear(Black);
-                com_ptr<ID2D1SolidColorBrush> brush;
-                target->CreateSolidColorBrush(Hairline, brush.put());
-                float th = ThumbHeight();
-                D2D1_RECT_F box = D2D1::RectF(Pad, Pad, Width - Pad, Pad + th);
-                if (bitmap)
-                {
-                    // Fit the snip in the box.
-                    float s = std::min((box.right - box.left) / pw, th / ph);
-                    float w = pw * s, h = ph * s;
-                    float x = box.left + ((box.right - box.left) - w) / 2, y = box.top + (th - h) / 2;
-                    target->DrawBitmap(bitmap.get(), D2D1::RectF(x, y, x + w, y + h), 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-                }
-                auto label = ui->Text(12, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
-                for (int i = 0; i < 5; ++i)
-                {
-                    auto r = Button(i);
-                    if (i == hover)
-                    {
-                        brush->SetColor(HoverFill);
-                        target->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(r.left + 2, r.top + 2, r.right - 2, r.bottom - 2), 999, 999), brush.get());
-                    }
-                    bool flashed = i == flashIndex && !flash.empty();
-                    brush->SetColor(flashed ? Good : Ink);
-                    std::wstring text = flashed ? flash : Labels[i];
-                    if (label) target->DrawText(text.c_str(), static_cast<UINT32>(text.size()), label.get(), r, brush.get());
-                }
-                if (target->EndDraw() == D2DERR_RECREATE_TARGET) target = nullptr;
-            }
-            EndPaint(hwnd, &ps);
-            return 0;
-        }
-        case WM_MOUSEMOVE:
-        {
-            if (!tracking)
-            {
-                TRACKMOUSEEVENT track{ sizeof(track), TME_LEAVE, hwnd, 0 };
-                TrackMouseEvent(&track);
-                tracking = true;
-                KillTimer(hwnd, 1);
-            }
-            int hit = HitTest(lp);
-            if (hit != hover) { hover = hit; InvalidateRect(hwnd, nullptr, FALSE); }
-            SetCursor(LoadCursorW(nullptr, hit >= 0 ? IDC_HAND : IDC_ARROW));
-            return 0;
-        }
-        case WM_MOUSELEAVE:
-            tracking = false;
-            hover = -1;
-            InvalidateRect(hwnd, nullptr, FALSE);
-            Restart();
-            return 0;
-        case WM_LBUTTONUP:
-        {
-            int hit = HitTest(lp);
-            if (hit < 0) return 0;
-            std::wstring action = Actions[hit];
-            if (action == L"copy" && !pixels.empty())
-            {
-                CopyImageToClipboard(hwnd, pixels.data(), pw, ph, pw * 4);
-                flash = L"Copied";
-                flashIndex = hit;
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
-            }
-            if (action == L"save")
-            {
-                SaveAs();
-                return 0;
-            }
-            if (action == L"folder") ShowInFolder(path);
-            if (action == L"discord") CopyFileToClipboard(hwnd, path);
-            if (onAction) onAction(action);
-            DestroyWindow(hwnd);
-            return 0;
-        }
-        case WM_TIMER:
-            DestroyWindow(hwnd);
-            return 0;
-        case WM_MOUSEACTIVATE:
-            return MA_NOACTIVATE;
-        case WM_SETCURSOR:
-            return TRUE;
-        case WM_DESTROY:
-            if (ui->card == this) ui->card = nullptr;
-            return 0;
-        }
-        return DefWindowProcW(hwnd, msg, wp, lp);
-    }
-
-    void SaveAs()
-    {
-        KillTimer(hwnd, 1);
-        com_ptr<IFileSaveDialog> dialog;
-        if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(dialog.put())))) return;
-        COMDLG_FILTERSPEC types[] = { { L"PNG image", L"*.png" } };
-        dialog->SetFileTypes(1, types);
-        dialog->SetDefaultExtension(L"png");
-        auto slash = path.find_last_of(L'\\');
-        dialog->SetFileName(slash == std::wstring::npos ? path.c_str() : path.c_str() + slash + 1);
-        if (SUCCEEDED(dialog->Show(hwnd)))
-        {
-            com_ptr<IShellItem> item;
-            wchar_t* chosen = nullptr;
-            if (SUCCEEDED(dialog->GetResult(item.put())) && SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &chosen)))
-            {
-                CopyFileW(path.c_str(), chosen, FALSE);
-                CoTaskMemFree(chosen);
-                flash = L"Saved";
-                flashIndex = 1;
-                InvalidateRect(hwnd, nullptr, FALSE);
-            }
-        }
-        Restart();
     }
 };
 
@@ -777,43 +603,12 @@ void Ui::Toast(const std::wstring& title, const std::wstring& detail, HMONITOR m
     });
 }
 
-void Ui::Preview(const std::wstring& path, const SnipResult& snip, std::function<void(const std::wstring&)> onAction)
-{
-    // A small copy of the snip is enough for the card.
-    auto pixels = std::make_shared<std::vector<uint8_t>>(snip.pixels);
-    UINT pw = snip.width, ph = snip.height;
-    HMONITOR monitor = snip.monitor;
-    Post([=] {
-        m->LoadFont(m_fontFile);
-        if (m->card) DestroyWindow(m->card->hwnd);
-        float scale = ScaleOf(monitor);
-        RECT work = WorkArea(monitor);
-        auto* win = new CardWin();
-        win->ui = m.get();
-        win->path = path;
-        win->pixels = std::move(*pixels);
-        win->pw = pw;
-        win->ph = ph;
-        win->scale = scale;
-        win->onAction = onAction;
-        int w = static_cast<int>(CardWin::Width * scale), h = static_cast<int>(win->Height() * scale);
-        int margin = static_cast<int>(16 * scale);
-        HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"ExoCapturePopup", L"Exo Capture snip",
-            WS_POPUP, work.right - w - margin, work.bottom - h - margin, w, h, nullptr, nullptr, GetModuleHandleW(nullptr), win);
-        if (!hwnd) { delete win; return; }
-        m->card = win;
-        Rounded(hwnd);
-        win->Restart();
-        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    });
-}
 
 void Ui::Snip(std::function<void(std::optional<SnipResult>)> done)
 {
     Post([=] {
         m->LoadFont(m_fontFile);
         if (m->snip) return; // one at a time
-        if (m->card) DestroyWindow(m->card->hwnd);
         int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
         int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN), vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
         auto* win = new SnipWin();
@@ -842,6 +637,19 @@ void Ui::Snip(std::function<void(std::optional<SnipResult>)> done)
         DeleteObject(dib);
         DeleteDC(memory);
         ReleaseDC(nullptr, screen);
+        // On an HDR screen that copy is not what you saw: there, its own picture tone-mapped to SDR takes its place.
+        EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR monitor, HDC, LPRECT, LPARAM lp) -> BOOL {
+            auto* w = reinterpret_cast<SnipWin*>(lp);
+            std::vector<uint8_t> hdr;
+            RECT r{};
+            if (!CaptureHdrMonitor(monitor, hdr, r)) return TRUE;
+            LONG left = r.left - w->vx, top = r.top - w->vy, mw = r.right - r.left, mh = r.bottom - r.top;
+            if (left < 0 || top < 0 || left + mw > w->vw || top + mh > w->vh) return TRUE;
+            for (LONG y = 0; y < mh; ++y)
+                memcpy(w->pixels.data() + (static_cast<size_t>(top + y) * w->vw + left) * 4,
+                    hdr.data() + static_cast<size_t>(y) * mw * 4, static_cast<size_t>(mw) * 4);
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(win));
 
         HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"ExoCapturePopup", L"Exo Capture snip",
             WS_POPUP, vx, vy, vw, vh, nullptr, nullptr, GetModuleHandleW(nullptr), win);

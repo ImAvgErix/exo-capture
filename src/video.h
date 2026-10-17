@@ -85,6 +85,8 @@ public:
         HMONITOR monitor = nullptr;
         UINT fps = 60;
         Codec codec = Codec::HEVC;
+        /// HEVC is the step down from AV1 (encoded and played back here); else H.264.
+        bool hevcFallback = false;
         int quality = 50;
         bool cursor = true;
         /// Take the game's frames from inside it (when Windows capture gets none).
@@ -177,3 +179,7 @@ UINT BitrateFor(Codec codec, UINT width, UINT height, UINT fps, int quality);
 UINT RefreshRate(HMONITOR monitor);
 /// True when Windows HDR is on for that monitor.
 bool MonitorIsHdr(HMONITOR monitor);
+/// An HDR monitor's picture as an sRGB snip that looks as it did on screen: SDR content exact, HDR
+/// highlights rolled off instead of clipped. False when it is not in HDR or the picture is not
+/// available; bounds is its place on the desktop.
+bool CaptureHdrMonitor(HMONITOR monitor, std::vector<uint8_t>& bgra, RECT& bounds);

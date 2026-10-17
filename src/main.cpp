@@ -26,7 +26,6 @@ struct Settings
     int maxFps = 60; // 60, or up to 120 where the screen runs that fast
     int replaySeconds = 60;
     std::wstring replayMode = L"games"; // games | always | off
-    bool audioGame = true, audioDiscord = false, audioMic = false, separateTracks = true;
     bool cursor = true;
     std::wstring folder;
     std::wstring thumbs;
@@ -287,14 +286,6 @@ private:
         next.thumbs = GetString(p, L"thumbs", next.thumbs);
         next.font = GetString(p, L"font", next.font);
         next.printScreen = GetBool(p, L"printScreen", next.printScreen);
-        if (p.HasKey(L"audio"))
-        {
-            auto a = p.GetNamedObject(L"audio");
-            next.audioGame = GetBool(a, L"game", next.audioGame);
-            next.audioDiscord = GetBool(a, L"discord", next.audioDiscord);
-            next.audioMic = GetBool(a, L"mic", next.audioMic);
-            next.separateTracks = GetBool(a, L"separate", next.separateTracks);
-        }
         if (p.HasKey(L"hotkeys"))
         {
             auto k = p.GetNamedObject(L"hotkeys");
@@ -302,9 +293,7 @@ private:
             next.keys[1] = GetString(k, L"record", next.keys[1]);
             next.keys[2] = GetString(k, L"snip", next.keys[2]);
         }
-        bool restart = next.quality != m_settings.quality || next.cursor != m_settings.cursor || next.maxFps != m_settings.maxFps ||
-            next.audioGame != m_settings.audioGame || next.audioDiscord != m_settings.audioDiscord ||
-            next.audioMic != m_settings.audioMic || next.separateTracks != m_settings.separateTracks;
+        bool restart = next.quality != m_settings.quality || next.cursor != m_settings.cursor || next.maxFps != m_settings.maxFps;
         {
             std::lock_guard lock(m_stateLock);
             m_settings = next;
@@ -435,6 +424,7 @@ private:
             // 60 halves the capture's work on the GPU; 120 only on a screen that shows it.
             options.fps = std::min<UINT>(RefreshRate(window ? MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) : options.monitor), m_settings.maxFps);
             options.codec = m_support.Best();
+            options.hevcFallback = m_support.hevc && m_support.hevcPlayback;
             options.quality = m_settings.quality;
             options.cursor = m_settings.cursor;
             options.gameHook = window && window == m_hookWindow && window != m_hookFailed;
@@ -442,10 +432,6 @@ private:
             auto video = std::make_unique<CaptureSession>(m_gpu, options, sink);
 
             AudioCapture::Options audio;
-            audio.game = m_settings.audioGame;
-            audio.discord = m_settings.audioDiscord;
-            audio.mic = m_settings.audioMic;
-            audio.separate = m_settings.separateTracks;
             if (window) GetWindowThreadProcessId(window, &audio.gamePid);
             audio.discordPid = FindDiscord();
             std::unique_ptr<AudioCapture> sound;
@@ -695,6 +681,8 @@ private:
             auto snip = std::make_shared<SnipResult>(std::move(*result));
             // On the window thread: the clipboard wants a window of ours.
             CopyImageToClipboard(m_ui.Window(), snip->pixels.data(), snip->width, snip->height, snip->width * 4);
+            // The snip opens in Exo's editor: we took the last click, so Exo may come to the front.
+            AllowSetForegroundWindow(ASFW_ANY);
             m_jobs.Post([this, snip] {
                 try
                 {
@@ -703,13 +691,6 @@ private:
                     SaveImage(path, snip->pixels.data(), snip->width, snip->height, snip->width * 4, true);
                     WriteThumb(m_settings.thumbs, path, snip->pixels, snip->width, snip->height);
                     Saved(L"snip", path, 0, GameId());
-                    m_ui.Preview(path, *snip, [path](const std::wstring& action) {
-                        if (action != L"edit" && action != L"discord") return;
-                        auto o = Obj();
-                        o.Insert(L"action", json::JsonValue::CreateStringValue(action));
-                        o.Insert(L"path", json::JsonValue::CreateStringValue(path));
-                        Emit(L"action", o);
-                    });
                 }
                 catch (const std::exception& e)
                 {

@@ -70,7 +70,9 @@ static GUID Subtype(Codec codec)
 
 namespace
 {
-/// The MFTs for a category and types; true and the first one's name when any matches the adapter.
+/// The MFTs for a category and types; true and the chosen one's name when any matches the adapter.
+/// One that says it is on this adapter wins over one that does not say: on a PC with two GPUs
+/// (an Intel or AMD iGPU beside the gaming card) the other GPU's encoder cannot read our frames.
 bool FindMft(const GUID& category, UINT32 flags, const GUID& inSub, const GUID& outSub, const LUID* luid,
     std::wstring* name, com_ptr<IMFActivate>* chosen)
 {
@@ -80,39 +82,35 @@ bool FindMft(const GUID& category, UINT32 flags, const GUID& inSub, const GUID& 
     UINT32 count = 0;
     if (FAILED(MFTEnumEx(category, flags, inSub == GUID_NULL ? nullptr : &in, outSub == GUID_NULL ? nullptr : &out, &list, &count)))
         return false;
-    bool found = false;
+    int exact = -1, unknown = -1;
     for (UINT32 i = 0; i < count; ++i)
     {
-        if (!found)
+        LUID adapter{};
+        UINT32 size = 0;
+        if (!luid || FAILED(list[i]->GetBlob(MFT_ENUM_ADAPTER_LUID, reinterpret_cast<UINT8*>(&adapter), sizeof(adapter), &size)))
         {
-            bool match = true;
-            if (luid)
+            if (unknown < 0) unknown = static_cast<int>(i);
+        }
+        else if (exact < 0 && adapter.LowPart == luid->LowPart && adapter.HighPart == luid->HighPart) exact = static_cast<int>(i);
+    }
+    int pick = exact >= 0 ? exact : unknown;
+    if (pick >= 0)
+    {
+        if (name)
+        {
+            wchar_t* text = nullptr;
+            UINT32 length = 0;
+            if (SUCCEEDED(list[pick]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &text, &length)))
             {
-                LUID adapter{};
-                UINT32 size = 0;
-                if (SUCCEEDED(list[i]->GetBlob(MFT_ENUM_ADAPTER_LUID, reinterpret_cast<UINT8*>(&adapter), sizeof(adapter), &size)))
-                    match = adapter.LowPart == luid->LowPart && adapter.HighPart == luid->HighPart;
-            }
-            if (match)
-            {
-                found = true;
-                if (name)
-                {
-                    wchar_t* text = nullptr;
-                    UINT32 length = 0;
-                    if (SUCCEEDED(list[i]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &text, &length)))
-                    {
-                        *name = text;
-                        CoTaskMemFree(text);
-                    }
-                }
-                if (chosen) chosen->copy_from(list[i]);
+                *name = text;
+                CoTaskMemFree(text);
             }
         }
-        list[i]->Release();
+        if (chosen) chosen->copy_from(list[pick]);
     }
+    for (UINT32 i = 0; i < count; ++i) list[i]->Release();
     CoTaskMemFree(list);
-    return found;
+    return pick >= 0;
 }
 }
 
@@ -127,16 +125,17 @@ EncoderSupport ProbeEncoders(const GpuDevice& gpu)
 {
     EncoderSupport s;
     const UINT32 hw = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
-    std::wstring name;
-    s.h264 = FindMft(MFT_CATEGORY_VIDEO_ENCODER, hw, MFVideoFormat_NV12, MFVideoFormat_H264, &gpu.luid, &name, nullptr);
-    if (s.h264) s.name = name;
-    s.hevc = FindMft(MFT_CATEGORY_VIDEO_ENCODER, hw, MFVideoFormat_NV12, MFVideoFormat_HEVC, &gpu.luid, &name, nullptr);
-    if (s.hevc) s.name = name;
-    s.av1 = FindMft(MFT_CATEGORY_VIDEO_ENCODER, hw, MFVideoFormat_NV12, MFVideoFormat_AV1, &gpu.luid, &name, nullptr);
-    if (s.av1) s.name = name;
+    // NVENC (GeForce), AMF (Radeon) and Quick Sync (Intel) all register here: AV1 on RTX 40, RX 7000
+    // and Arc or newer, HEVC on nearly every card since 2016, H.264 on the rest.
+    std::wstring names[3];
+    s.h264 = FindMft(MFT_CATEGORY_VIDEO_ENCODER, hw, MFVideoFormat_NV12, MFVideoFormat_H264, &gpu.luid, &names[0], nullptr);
+    s.hevc = FindMft(MFT_CATEGORY_VIDEO_ENCODER, hw, MFVideoFormat_NV12, MFVideoFormat_HEVC, &gpu.luid, &names[1], nullptr);
+    s.av1 = FindMft(MFT_CATEGORY_VIDEO_ENCODER, hw, MFVideoFormat_NV12, MFVideoFormat_AV1, &gpu.luid, &names[2], nullptr);
     const UINT32 any = MFT_ENUM_FLAG_ALL;
     s.hevcPlayback = FindMft(MFT_CATEGORY_VIDEO_DECODER, any, MFVideoFormat_HEVC, GUID_NULL, nullptr, nullptr, nullptr);
     s.av1Playback = FindMft(MFT_CATEGORY_VIDEO_DECODER, any, MFVideoFormat_AV1, GUID_NULL, nullptr, nullptr, nullptr);
+    Codec best = s.Best();
+    s.name = names[best == Codec::AV1 ? 2 : best == Codec::HEVC ? 1 : 0];
     return s;
 }
 
@@ -185,6 +184,188 @@ bool MonitorIsHdr(HMONITOR monitor)
         }
     }
     return false;
+}
+
+// ---------------------------------------------------------------- HDR snips
+
+namespace
+{
+/// Windows' "SDR content brightness" for the monitor in scRGB (1.0 = 80 nits); 0 when unknown.
+float SdrWhite(HMONITOR monitor)
+{
+    MONITORINFOEXW info{};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(monitor, &info)) return 0;
+    UINT32 pathCount = 0, modeCount = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS) return 0;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(), nullptr) != ERROR_SUCCESS) return 0;
+    for (UINT32 i = 0; i < pathCount; ++i)
+    {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+        source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        source.header.size = sizeof(source);
+        source.header.adapterId = paths[i].sourceInfo.adapterId;
+        source.header.id = paths[i].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS || wcscmp(source.viewGdiDeviceName, info.szDevice) != 0) continue;
+        DISPLAYCONFIG_SDR_WHITE_LEVEL white{};
+        white.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+        white.header.size = sizeof(white);
+        white.header.adapterId = paths[i].targetInfo.adapterId;
+        white.header.id = paths[i].targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&white.header) != ERROR_SUCCESS) return 0;
+        return white.SDRWhiteLevel / 1000.f;
+    }
+    return 0;
+}
+
+float HalfToFloat(uint16_t h)
+{
+    uint32_t sign = (h & 0x8000u) << 16, exponent = (h >> 10) & 0x1F, mantissa = h & 0x3FF;
+    uint32_t bits;
+    if (exponent == 0)
+    {
+        if (!mantissa) bits = sign;
+        else
+        {
+            // Subnormal: normalise it.
+            int e = 1;
+            while (!(mantissa & 0x400)) { mantissa <<= 1; --e; }
+            mantissa &= 0x3FF;
+            bits = sign | (static_cast<uint32_t>(e + 112) << 23) | (mantissa << 13);
+        }
+    }
+    else if (exponent == 31) bits = sign | 0x7F800000u | (mantissa << 13);
+    else bits = sign | ((exponent + 112) << 23) | (mantissa << 13);
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+}
+
+bool CaptureHdrMonitor(HMONITOR monitor, std::vector<uint8_t>& bgra, RECT& bounds)
+{
+    try
+    {
+        com_ptr<IDXGIFactory1> factory;
+        Check(CreateDXGIFactory1(IID_PPV_ARGS(factory.put())), "DXGI factory");
+        com_ptr<IDXGIAdapter1> adapter;
+        com_ptr<IDXGIOutput6> output;
+        DXGI_OUTPUT_DESC1 desc{};
+        for (UINT a = 0; !output && factory->EnumAdapters1(a, adapter.put()) != DXGI_ERROR_NOT_FOUND; ++a)
+        {
+            com_ptr<IDXGIOutput> candidate;
+            for (UINT o = 0; adapter->EnumOutputs(o, candidate.put()) != DXGI_ERROR_NOT_FOUND; ++o, candidate = nullptr)
+            {
+                auto six = candidate.try_as<IDXGIOutput6>();
+                if (six && SUCCEEDED(six->GetDesc1(&desc)) && desc.Monitor == monitor) { output = six; break; }
+            }
+            if (!output) adapter = nullptr;
+        }
+        // shortcut: a rotated screen keeps the plain snip; its duplicated picture would need turning first.
+        if (!output || desc.ColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+            (desc.Rotation != DXGI_MODE_ROTATION_IDENTITY && desc.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED))
+            return false;
+        float white = SdrWhite(monitor);
+        if (white <= 0) return false;
+
+        com_ptr<ID3D11Device> device;
+        com_ptr<ID3D11DeviceContext> context;
+        Check(D3D11CreateDevice(adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+            device.put(), nullptr, context.put()), "snip device");
+        // The screen as Windows composes it in HDR: linear scRGB, half floats.
+        com_ptr<IDXGIOutputDuplication> duplication;
+        DXGI_FORMAT formats[] = { DXGI_FORMAT_R16G16B16A16_FLOAT };
+        Check(output->DuplicateOutput1(device.get(), 0, 1, formats, duplication.put()), "screen copy");
+        DXGI_OUTDUPL_FRAME_INFO frame{};
+        com_ptr<IDXGIResource> resource;
+        Check(duplication->AcquireNextFrame(500, &frame, resource.put()), "screen frame");
+        auto texture = resource.as<ID3D11Texture2D>();
+        D3D11_TEXTURE2D_DESC td{};
+        texture->GetDesc(&td);
+        td.Usage = D3D11_USAGE_STAGING;
+        td.BindFlags = 0;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        td.MiscFlags = 0;
+        com_ptr<ID3D11Texture2D> staging;
+        HRESULT hr = device->CreateTexture2D(&td, nullptr, staging.put());
+        if (SUCCEEDED(hr)) context->CopyResource(staging.get(), texture.get());
+        duplication->ReleaseFrame();
+        Check(hr, "screen copy texture");
+        bounds = desc.DesktopCoordinates;
+        UINT w = td.Width, h = td.Height;
+        if (td.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || static_cast<LONG>(w) != bounds.right - bounds.left ||
+            static_cast<LONG>(h) != bounds.bottom - bounds.top)
+            return false;
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        Check(context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped), "screen read");
+
+        // Linear light where 1.0 is SDR white: the desktop and SDR apps come out as they look.
+        std::vector<float> linear(static_cast<size_t>(w) * h * 3);
+        float peak = 0;
+        for (UINT y = 0; y < h; ++y)
+        {
+            auto* row = reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(mapped.pData) + static_cast<size_t>(mapped.RowPitch) * y);
+            float* out = linear.data() + static_cast<size_t>(y) * w * 3;
+            for (UINT x = 0; x < w; ++x)
+                for (int c = 0; c < 3; ++c)
+                {
+                    float v = std::max(0.f, HalfToFloat(row[x * 4 + c]) / white);
+                    if (!(v < 1e4f)) v = 0; // NaN or infinity
+                    out[x * 3 + c] = v;
+                    peak = std::max(peak, v);
+                }
+        }
+        context->Unmap(staging.get(), 0);
+
+        // Brighter than SDR white (an HDR game or video): roll the highlights off above a knee so the
+        // brightest pixel lands on white, instead of clipping them flat. Hue holds: all three channels scale.
+        const float knee = 0.75f;
+        const float range = (peak - knee) / (1 - knee);
+        auto toneMap = [&](float m) {
+            float u = (m - knee) / (1 - knee);
+            return knee + (1 - knee) * u * (1 + u / (range * range)) / (1 + u);
+        };
+        // sRGB encoding through a table: a 4K screen is 25 million channels.
+        static const std::vector<uint8_t> encode = [] {
+            std::vector<uint8_t> t(16384);
+            for (size_t i = 0; i < t.size(); ++i)
+            {
+                double v = static_cast<double>(i) / (t.size() - 1);
+                double s = v <= 0.0031308 ? 12.92 * v : 1.055 * std::pow(v, 1 / 2.4) - 0.055;
+                t[i] = static_cast<uint8_t>(std::clamp(s * 255 + 0.5, 0.0, 255.0));
+            }
+            return t;
+        }();
+        auto q = [&](float v) { return encode[static_cast<size_t>(std::clamp(v, 0.f, 1.f) * (encode.size() - 1) + 0.5f)]; };
+        bgra.resize(static_cast<size_t>(w) * h * 4);
+        for (size_t p = 0, n = static_cast<size_t>(w) * h; p < n; ++p)
+        {
+            float r = linear[p * 3], g = linear[p * 3 + 1], b = linear[p * 3 + 2];
+            float m = std::max({ r, g, b });
+            if (peak > 1.001f && m > knee)
+            {
+                float k = toneMap(m) / m;
+                r *= k; g *= k; b *= k;
+            }
+            bgra[p * 4] = q(b);
+            bgra[p * 4 + 1] = q(g);
+            bgra[p * 4 + 2] = q(r);
+            bgra[p * 4 + 3] = 255;
+        }
+        return true;
+    }
+    catch (const std::exception& e)
+    {
+        Log(std::string("HDR snip: ") + e.what() + "; the plain one is kept.");
+        return false;
+    }
+    catch (winrt::hresult_error const& e)
+    {
+        Log("HDR snip: " + Narrow(std::wstring(e.message())) + "; the plain one is kept.");
+        return false;
+    }
 }
 
 // ---------------------------------------------------------------- encoder
@@ -548,6 +729,7 @@ CaptureSession::CaptureSession(std::shared_ptr<GpuDevice> gpu, const Options& op
     HMONITOR monitor = options.window ? MonitorFromWindow(options.window, MONITOR_DEFAULTTONEAREST) : options.monitor;
     m_hdr = m_codec != Codec::H264 && MonitorIsHdr(monitor);
     winrt::Windows::Graphics::SizeInt32 size{};
+    bool wide = true; // false: the frames from inside the game are SDR
     if (options.window && options.gameHook)
     {
         try { m_hook = GameHook::Start(options.window, 1'000'000'000ull / m_fps, m_gpu->device.get()); }
@@ -559,7 +741,7 @@ CaptureSession::CaptureSession(std::shared_ptr<GpuDevice> gpu, const Options& op
         // An SDR game on an HDR screen stays SDR: its frames are what the game drew.
         D3D11_TEXTURE2D_DESC desc{};
         if (auto frame = m_hook->Frame()) frame->GetDesc(&desc);
-        bool wide = desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || desc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS ||
+        wide = desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || desc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS ||
             desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM || desc.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS;
         m_hdr = m_hdr && wide;
     }
@@ -580,20 +762,27 @@ CaptureSession::CaptureSession(std::shared_ptr<GpuDevice> gpu, const Options& op
     m_videoDevice = m_gpu->device.as<ID3D11VideoDevice>();
     m_videoContext = m_gpu->context.as<ID3D11VideoContext>();
 
-    auto makeEncoder = [&] {
-        m_encoder = std::make_unique<VideoEncoder>(*m_gpu, m_codec, m_width, m_height, m_fps, m_bitrate, m_hdr, sink);
-    };
-    try { makeEncoder(); }
-    catch (const std::exception& e)
+    // A driver can list an encoder that then refuses this size or HDR: step down, HDR before SDR,
+    // AV1 to HEVC to H.264 (which carries no HDR), until one starts.
+    for (;;)
     {
-        Log(std::string("Encoder with first choice failed: ") + e.what());
-        if (m_hdr) m_hdr = false;
-        else if (m_codec != Codec::H264)
+        try
         {
-            m_codec = Codec::H264;
             m_bitrate = BitrateFor(m_codec, m_width, m_height, m_fps, options.quality);
+            m_encoder = std::make_unique<VideoEncoder>(*m_gpu, m_codec, m_width, m_height, m_fps, m_bitrate, m_hdr, sink);
+            break;
         }
-        makeEncoder();
+        catch (const std::exception& e)
+        {
+            Log(std::string("Encoder ") + Narrow(CodecName(m_codec)) + (m_hdr ? " HDR" : "") + " failed: " + e.what());
+            if (m_hdr) m_hdr = false;
+            else if (m_codec == Codec::H264) throw;
+            else
+            {
+                m_codec = m_codec == Codec::AV1 && options.hevcFallback ? Codec::HEVC : Codec::H264;
+                m_hdr = m_codec != Codec::H264 && MonitorIsHdr(monitor) && wide;
+            }
+        }
     }
 
     DXGI_FORMAT targetFormat = m_hdr ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;

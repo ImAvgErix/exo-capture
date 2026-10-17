@@ -90,5 +90,3 @@ bool ReadImageFile(const std::wstring& path, std::vector<uint8_t>& pixels, UINT&
 bool CopyImageToClipboard(HWND owner, const uint8_t* bgra, UINT width, UINT height, UINT stride);
 /// Puts a file on the clipboard as a file drop, so it pastes into Discord or Explorer.
 bool CopyFileToClipboard(HWND owner, const std::wstring& path);
-/// Opens Explorer on the file's folder with the file selected.
-void ShowInFolder(const std::wstring& path);

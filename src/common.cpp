@@ -280,17 +280,3 @@ bool CopyFileToClipboard(HWND owner, const std::wstring& path)
     CloseClipboard();
     return ok;
 }
-
-void ShowInFolder(const std::wstring& path)
-{
-    PIDLIST_ABSOLUTE item = nullptr;
-    if (SUCCEEDED(SHParseDisplayName(path.c_str(), nullptr, &item, 0, nullptr)) && item)
-    {
-        SHOpenFolderAndSelectItems(item, 0, nullptr, 0);
-        CoTaskMemFree(item);
-        return;
-    }
-    auto slash = path.find_last_of(L'\\');
-    if (slash != std::wstring::npos)
-        ShellExecuteW(nullptr, L"open", path.substr(0, slash).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-}
