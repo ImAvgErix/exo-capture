@@ -34,12 +34,16 @@ struct EncoderSupport
     Codec Best() const;
 };
 EncoderSupport ProbeEncoders(const GpuDevice& gpu);
+/// The parameter sets (VPS/SPS/PPS) in an Annex B key frame, each with a four-byte start code; empty when it has none.
+std::vector<uint8_t> ParameterSets(const std::vector<uint8_t>& data, Codec codec);
 
 /// The GPU's hardware encoder (NVENC, AMF or Quick Sync through its Media Foundation transform), async.
 class VideoEncoder
 {
 public:
-    VideoEncoder(GpuDevice& gpu, Codec codec, UINT width, UINT height, UINT fps, UINT bitrate, bool hdr,
+    /// realtime: a live stream (Go Live) at a constant rate the network carries, a key frame every
+    /// five seconds; else a file's quality-led rate, a key frame every two.
+    VideoEncoder(GpuDevice& gpu, Codec codec, UINT width, UINT height, UINT fps, UINT bitrate, bool hdr, bool realtime,
         std::function<void(PacketPtr)> sink);
     ~VideoEncoder();
     /// Queues one NV12/P010 texture; released() runs once the encoder no longer reads it.
@@ -91,6 +95,12 @@ public:
         bool cursor = true;
         /// Take the game's frames from inside it (when Windows capture gets none).
         bool gameHook = false;
+        /// The encoded picture's size (even); 0 keeps the content's own, up to 4K.
+        UINT width = 0, height = 0;
+        /// Bits per second; 0 works it out from quality.
+        UINT bitrate = 0;
+        /// Go Live: a constant bit rate for the network and a key frame every five seconds (and on request).
+        bool realtime = false;
     };
 
     CaptureSession(std::shared_ptr<GpuDevice> gpu, const Options& options, std::function<void(PacketPtr)> sink);
@@ -110,8 +120,8 @@ public:
     SIZE ContentSize() const;
     com_ptr<IMFMediaType> VideoType() { return m_encoder->OutputType(); }
     void ForceKeyFrame() { if (m_encoder) m_encoder->ForceKeyFrame(); }
-    /// The newest frame as BGRA pixels, for a thumbnail. False when there is none (or HDR).
-    bool LastFrame(std::vector<uint8_t>& pixels, UINT& width, UINT& height);
+    /// The newest frame as BGRA pixels at most maxWidth across, for a thumbnail. False when there is none (or HDR).
+    bool LastFrame(std::vector<uint8_t>& pixels, UINT& width, UINT& height, UINT maxWidth = 480);
     /// Frames converted and dropped since the start (dropped: the encoder was still busy).
     uint64_t Frames() const { return m_frames; }
     uint64_t Dropped() const { return m_dropped; }
@@ -134,6 +144,7 @@ private:
     UINT m_width = 0, m_height = 0, m_fps = 60, m_bitrate = 0;
     bool m_hdr = false;
     int64_t m_interval = 166'667;
+    int64_t m_keyInterval = 10'000'000;
 
     winrt::Windows::Graphics::Capture::GraphicsCaptureItem m_item{ nullptr };
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool m_pool{ nullptr };
@@ -151,6 +162,7 @@ private:
     com_ptr<ID3D11Texture2D> m_copy;
     com_ptr<ID3D11VideoProcessorInputView> m_copyView;
     int m_lastIndex = -1; // the target holding the newest converted frame
+    int m_pending = -1;   // Go Live: the newest converted frame not sent yet (the stream's clock sends it)
     RECT m_lastDest{};
     SIZE m_content{};
     com_ptr<ID3D11VideoDevice> m_videoDevice;
@@ -172,6 +184,10 @@ private:
     std::unique_ptr<GameHook> m_hook;
     std::thread m_pump;
 };
+
+/// One picture of a window or screen as a JPEG at most maxWidth across, for Go Live's picker and
+/// preview (no cursor, no border). Empty when Windows gives no picture within a second (a minimized window).
+std::vector<uint8_t> GrabFrame(GpuDevice& gpu, HWND window, HMONITOR monitor, UINT maxWidth);
 
 /// Bits per second for a quality from 0 (smaller files) to 100 (best quality).
 UINT BitrateFor(Codec codec, UINT width, UINT height, UINT fps, int quality);

@@ -251,6 +251,7 @@ struct SnipWin : Win
     bool dragging = false;
     POINT start{}, now{};
     RECT selection{};
+    RECT hintScreen{};
     bool finished = false;
 
     RECT Normalized(POINT a, POINT b) const
@@ -331,10 +332,32 @@ struct SnipWin : Win
                 target->FillRectangle(D2D1::RectF(0, b, float(vw), float(vh)), dim.get());
                 target->FillRectangle(D2D1::RectF(0, t, l, b), dim.get());
                 target->FillRectangle(D2D1::RectF(r, t, float(vw), b), dim.get());
+                // Until a drag starts, how it works, in a pill at the top of the screen under the pointer
+                // (macOS and the Snipping Tool say it the same way).
+                if (!dragging)
+                {
+                    RECT m = MonitorAt(now);
+                    float scale = ScaleOf(MonitorFromPoint({ now.x + vx, now.y + vy }, MONITOR_DEFAULTTONEAREST));
+                    const wchar_t* hint = L"Drag to snip  \u00B7  Click a window  \u00B7  Enter for the whole screen  \u00B7  Esc to cancel";
+                    float w = 520 * scale, h = 36 * scale;
+                    float cx = (m.left + m.right) / 2.f;
+                    D2D1_RECT_F pill = D2D1::RectF(cx - w / 2, m.top + 24 * scale, cx + w / 2, m.top + 24 * scale + h);
+                    com_ptr<ID2D1SolidColorBrush> paint;
+                    target->CreateSolidColorBrush(D2D1::ColorF(0.04f, 0.04f, 0.04f, 0.92f), paint.put());
+                    target->FillRoundedRectangle(D2D1::RoundedRect(pill, h / 2, h / 2), paint.get());
+                    paint->SetColor(Hairline);
+                    target->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(pill.left + 0.5f, pill.top + 0.5f, pill.right - 0.5f, pill.bottom - 0.5f), h / 2, h / 2), paint.get(), 1);
+                    paint->SetColor(Ink);
+                    if (auto format = ui->Text(13 * scale, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER))
+                        target->DrawText(hint, static_cast<UINT32>(wcslen(hint)), format.get(), pill, paint.get());
+                }
                 if (r > l && b > t)
                 {
                     com_ptr<ID2D1SolidColorBrush> line;
-                    target->CreateSolidColorBrush(Ink, line.put());
+                    // A dark line just outside the cream one keeps the edge visible over bright pictures.
+                    target->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0.6f), line.put());
+                    target->DrawRectangle(D2D1::RectF(l - 0.5f, t - 0.5f, r + 0.5f, b + 0.5f), line.get(), 1);
+                    line->SetColor(Ink);
                     target->DrawRectangle(D2D1::RectF(l + 0.5f, t + 0.5f, r - 0.5f, b - 0.5f), line.get(), 1);
                     // Its size, in a small black pill above (or inside) the corner.
                     wchar_t text[32];
@@ -358,14 +381,17 @@ struct SnipWin : Win
             dragging = true;
             start = now = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             SetCapture(hwnd);
+            InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         case WM_MOUSEMOVE:
         {
             now = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             RECT next = dragging && (std::abs(now.x - start.x) > 4 || std::abs(now.y - start.y) > 4) ? Normalized(start, now) : WindowAt(now);
-            if (!EqualRect(&next, &selection))
+            RECT screen = MonitorAt(now);
+            if (!EqualRect(&next, &selection) || !EqualRect(&screen, &hintScreen))
             {
                 selection = next;
+                hintScreen = screen;
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             return 0;

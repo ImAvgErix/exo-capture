@@ -1,9 +1,10 @@
-// Exo Capture - instant replay, recording and snips for Exo Launcher. GPL-3.0-or-later.
+// Exo Capture - instant replay, recording, snips and Go Live for Exo Launcher. GPL-3.0-or-later.
 //
 // Exo starts this program and talks to it over its standard input and output only
 // (one JSON object per line), so no other program can reach it: there is no port
 // and no named pipe. Requests: {"id", "method", "params"}; replies: {"id", "result"}
-// or {"id", "error"}; events: {"event", "data"}.
+// or {"id", "error"}; events: {"event", "data"}. Go Live's encoded frames go back on an
+// anonymous pipe whose write end Exo duplicates into this process (see Streamer).
 #include "common.h"
 #include "audio.h"
 #include "mux.h"
@@ -159,6 +160,153 @@ std::wstring ThumbName(const std::wstring& path)
     return text;
 }
 
+/// Go Live (Exo's Discord client): one window or screen encoded for Discord's servers (H.264, a
+/// constant bit rate, a key frame every five seconds and whenever Discord asks) and written to the
+/// pipe Exo made and handed over (its write end duplicated into this process; no other program has
+/// it). Per frame: a 16-byte header (u32 length, u32 flags with 1 for a key frame, i64 capture time
+/// in 100 ns) and the frame (Annex B, its SPS and PPS in front of every key frame). Exo encrypts
+/// and sends it; the picture never passes through Exo's page.
+class Streamer
+{
+public:
+    Streamer(std::shared_ptr<GpuDevice> gpu, const CaptureSession::Options& options, HANDLE pipe, std::function<void(const char*)> ended)
+        : m_pipe(pipe), m_ended(std::move(ended))
+    {
+        m_video = std::make_unique<CaptureSession>(std::move(gpu), options, [this](PacketPtr packet) { OnPacket(packet); });
+        m_writer = std::thread([this] { Write(); });
+        m_watch = std::thread([this] { Watch(); });
+    }
+
+    ~Streamer()
+    {
+        {
+            std::lock_guard lock(m_lock);
+            m_stop = true;
+        }
+        m_wake.notify_all();
+        // A write Exo stopped reading blocks: cancel it rather than wait.
+        if (m_writer.joinable())
+        {
+            CancelSynchronousIo(m_writer.native_handle());
+            m_writer.join();
+        }
+        if (m_watch.joinable()) m_watch.join();
+        m_video.reset();
+        CloseHandle(m_pipe);
+    }
+
+    CaptureSession& Session() { return *m_video; }
+
+private:
+    void OnPacket(const PacketPtr& packet)
+    {
+        if (packet->track != 0 || m_stop) return;
+        PacketPtr out = packet;
+        std::lock_guard lock(m_lock);
+        if (packet->key)
+        {
+            // A viewer joins at a key frame: it must carry the parameter sets, whatever the encoder does.
+            auto sets = ParameterSets(packet->data, Codec::H264);
+            if (!sets.empty()) m_sets = std::move(sets);
+            else if (!m_sets.empty())
+            {
+                auto copy = std::make_shared<Packet>(*packet);
+                copy->data.insert(copy->data.begin(), m_sets.begin(), m_sets.end());
+                out = copy;
+            }
+        }
+        if (m_skipping && !out->key) return;
+        m_skipping = false;
+        // Exo fell two seconds behind: start over at the next key frame rather than send old pictures.
+        if (m_queue.size() >= 120)
+        {
+            m_queue.clear();
+            if (!out->key) { m_skipping = true; m_wantKey = true; return; }
+        }
+        m_queue.push_back(out);
+        m_wake.notify_one();
+    }
+
+    void Write()
+    {
+        for (;;)
+        {
+            PacketPtr packet;
+            {
+                std::unique_lock lock(m_lock);
+                m_wake.wait(lock, [this] { return m_stop || !m_queue.empty(); });
+                if (m_stop) return;
+                packet = m_queue.front();
+                m_queue.pop_front();
+            }
+            uint8_t header[16]{};
+            uint32_t length = static_cast<uint32_t>(packet->data.size()), flags = packet->key ? 1u : 0u;
+            int64_t time = packet->time;
+            memcpy(header, &length, 4);
+            memcpy(header + 4, &flags, 4);
+            memcpy(header + 8, &time, 8);
+            if (!WriteAll(header, sizeof(header)) || !WriteAll(packet->data.data(), length))
+            {
+                if (!m_stop) End("Exo stopped reading the stream");
+                return;
+            }
+        }
+    }
+
+    bool WriteAll(const uint8_t* data, size_t length)
+    {
+        while (length > 0)
+        {
+            DWORD wrote = 0;
+            if (!WriteFile(m_pipe, data, static_cast<DWORD>(std::min<size_t>(length, 1 << 20)), &wrote, nullptr) || wrote == 0) return false;
+            data += wrote;
+            length -= wrote;
+        }
+        return true;
+    }
+
+    void Watch()
+    {
+        while (!m_stop)
+        {
+            Sleep(100);
+            if (m_wantKey.exchange(false)) m_video->ForceKeyFrame();
+            if (!m_video->Alive()) { End("the window closed"); return; }
+        }
+    }
+
+    void End(const char* why)
+    {
+        if (m_endedOnce.exchange(true)) return;
+        Log(std::string("Go Live ended: ") + why + ".");
+        m_ended(why);
+    }
+
+    HANDLE m_pipe;
+    std::function<void(const char*)> m_ended;
+    std::mutex m_lock;
+    std::condition_variable m_wake;
+    std::deque<PacketPtr> m_queue;
+    std::vector<uint8_t> m_sets;
+    bool m_skipping = false;
+    std::atomic<bool> m_stop{ false }, m_wantKey{ false }, m_endedOnce{ false };
+    std::unique_ptr<CaptureSession> m_video;
+    std::thread m_writer, m_watch;
+};
+
+HWND WindowParam(const json::JsonObject& p)
+{
+    auto hwnd = reinterpret_cast<HWND>(static_cast<intptr_t>(GetNumber(p, L"window", 0)));
+    return hwnd && IsWindow(hwnd) ? hwnd : nullptr;
+}
+
+HMONITOR MonitorParam(const json::JsonObject& p)
+{
+    auto monitor = reinterpret_cast<HMONITOR>(static_cast<intptr_t>(GetNumber(p, L"monitor", 0)));
+    MONITORINFO info{ sizeof(info) };
+    return monitor && GetMonitorInfoW(monitor, &info) ? monitor : nullptr;
+}
+
 class Controller
 {
 public:
@@ -183,6 +331,7 @@ public:
     {
         if (m_quit.exchange(true)) return;
         if (m_ticker.joinable()) m_ticker.join();
+        StopStream(0, {}, false);
         m_jobs.Invoke([this] {
             StopRecording(false);
             StopSession();
@@ -216,6 +365,20 @@ public:
         if (method == L"export") return Export(p);
         if (method == L"copy") return CopyFile(p);
         if (method == L"probe") return Probe(Checked(p, L"path"));
+        if (method == L"stream.thumbs") return Thumbs(p);
+        if (method == L"stream.start") return StartStream(p);
+        if (method == L"stream.keyframe")
+        {
+            std::lock_guard lock(m_streamLock);
+            if (m_stream) m_stream->Session().ForceKeyFrame();
+            return json::JsonValue::CreateBooleanValue(m_stream != nullptr);
+        }
+        if (method == L"stream.preview") return StreamPreview(p);
+        if (method == L"stream.stop")
+        {
+            StopStream(static_cast<uint64_t>(GetNumber(p, L"id", 0)), {}, false);
+            return json::JsonValue::CreateBooleanValue(true);
+        }
         if (method == L"copyImage")
         {
             auto input = Checked(p, L"path");
@@ -272,6 +435,119 @@ public:
     void PostState() { Emit(L"state", State()); }
 
 private:
+    // ------------------------------------------------------------ Go Live
+
+    /// A picture of each window or screen asked for, at once: {id: JPEG base64}; none for one
+    /// Windows gives no picture (a minimized window).
+    json::IJsonValue Thumbs(const json::JsonObject& p)
+    {
+        struct Item { std::wstring id; HWND window; HMONITOR monitor; std::vector<uint8_t> jpeg; };
+        std::vector<Item> items;
+        auto list = p.HasKey(L"items") ? p.GetNamedArray(L"items") : json::JsonArray();
+        for (uint32_t i = 0; i < list.Size() && items.size() < 64; ++i)
+        {
+            if (list.GetAt(i).ValueType() != json::JsonValueType::Object) continue;
+            auto o = list.GetObjectAt(i);
+            Item item{ GetString(o, L"id"), WindowParam(o), MonitorParam(o), {} };
+            if (!item.id.empty() && (item.window || item.monitor)) items.push_back(std::move(item));
+        }
+        UINT width = static_cast<UINT>(std::clamp(GetNumber(p, L"width", 360), 64.0, 1920.0));
+        std::vector<std::thread> threads;
+        for (auto& item : items)
+            threads.emplace_back([this, &item, width] {
+                winrt::init_apartment(winrt::apartment_type::multi_threaded);
+                try { item.jpeg = GrabFrame(*m_gpu, item.window, item.window ? nullptr : item.monitor, width); }
+                catch (const std::exception& e) { Log(std::string("Go Live picture: ") + e.what()); }
+                catch (winrt::hresult_error const& e) { Log("Go Live picture: " + Narrow(std::wstring(e.message()))); }
+            });
+        for (auto& thread : threads) thread.join();
+        auto out = Obj();
+        for (auto& item : items)
+            if (!item.jpeg.empty()) out.Insert(item.id, json::JsonValue::CreateStringValue(Base64(item.jpeg)));
+        return out;
+    }
+
+    json::IJsonValue StartStream(const json::JsonObject& p)
+    {
+        auto pipe = reinterpret_cast<HANDLE>(static_cast<intptr_t>(GetNumber(p, L"pipe", 0)));
+        if (!pipe || GetFileType(pipe) != FILE_TYPE_PIPE) throw std::runtime_error("Exo gave no pipe for the stream.");
+        CaptureSession::Options options;
+        options.window = WindowParam(p);
+        options.monitor = options.window ? nullptr : MonitorParam(p);
+        if (!options.window && !options.monitor)
+        {
+            CloseHandle(pipe);
+            throw std::runtime_error("That window or screen is gone.");
+        }
+        options.fps = static_cast<UINT>(std::clamp(GetNumber(p, L"fps", 30), 10.0, 60.0));
+        options.codec = Codec::H264;
+        options.cursor = GetBool(p, L"cursor", true);
+        options.width = static_cast<UINT>(std::clamp(GetNumber(p, L"width", 0), 0.0, 4096.0));
+        options.height = static_cast<UINT>(std::clamp(GetNumber(p, L"height", 0), 0.0, 4096.0));
+        options.bitrate = static_cast<UINT>(std::clamp(GetNumber(p, L"bitrate", 6e6), 5e5, 5e7));
+        options.realtime = true;
+        StopStream(0, {}, false);
+        auto id = ++m_streamIds;
+        std::unique_ptr<Streamer> stream;
+        try
+        {
+            stream = std::make_unique<Streamer>(m_gpu, options, pipe, [this, id](const char* why) {
+                std::string reason = why;
+                std::thread([this, id, reason] { StopStream(id, reason, true); }).detach();
+            });
+        }
+        catch (...)
+        {
+            CloseHandle(pipe);
+            throw;
+        }
+        // The encoder's first frame says the picture comes through (it waits up to 3 s).
+        if (!stream->Session().VideoType()) throw std::runtime_error("That window gives no picture; is it minimized?");
+        auto& video = stream->Session();
+        auto o = Obj();
+        o.Insert(L"id", json::JsonValue::CreateNumberValue(static_cast<double>(id)));
+        o.Insert(L"width", json::JsonValue::CreateNumberValue(video.Width()));
+        o.Insert(L"height", json::JsonValue::CreateNumberValue(video.Height()));
+        o.Insert(L"fps", json::JsonValue::CreateNumberValue(video.Fps()));
+        o.Insert(L"bitrate", json::JsonValue::CreateNumberValue(video.Bitrate()));
+        Log("Go Live: " + std::to_string(video.Width()) + "x" + std::to_string(video.Height()) + " @" + std::to_string(video.Fps()) +
+            " H.264 " + std::to_string(video.Bitrate() / 1000) + " kbit/s" + (options.window ? " (window)" : " (screen)"));
+        std::lock_guard lock(m_streamLock);
+        m_stream = std::move(stream);
+        m_streamId = id;
+        return o;
+    }
+
+    /// What the stream sends now, as a JPEG at most width across; null before the first picture.
+    json::IJsonValue StreamPreview(const json::JsonObject& p)
+    {
+        UINT width = static_cast<UINT>(std::clamp(GetNumber(p, L"width", 480), 64.0, 1920.0));
+        std::vector<uint8_t> pixels;
+        UINT w = 0, h = 0;
+        {
+            std::lock_guard lock(m_streamLock);
+            if (!m_stream || !m_stream->Session().LastFrame(pixels, w, h, width)) return json::JsonValue::CreateNullValue();
+        }
+        return json::JsonValue::CreateStringValue(Base64(EncodeJpeg(pixels.data(), w, h, w * 4, 0)));
+    }
+
+    /// Stops the stream (id 0: whichever runs; else only that one, so a late stop never ends a newer
+    /// stream). tell: it ended on its own, and Exo hears why.
+    void StopStream(uint64_t id, const std::string& why, bool tell)
+    {
+        std::unique_ptr<Streamer> stream;
+        {
+            std::lock_guard lock(m_streamLock);
+            if (!m_stream || (id && id != m_streamId)) return;
+            stream = std::move(m_stream);
+        }
+        stream.reset();
+        if (!tell) return;
+        auto o = Obj();
+        o.Insert(L"reason", json::JsonValue::CreateStringValue(Widen(why)));
+        Emit(L"stream.ended", o);
+    }
+
     // ------------------------------------------------------------ settings
 
     void Configure(const json::JsonObject& p)
@@ -944,6 +1220,11 @@ private:
 
     std::mutex m_recorderLock;
     std::unique_ptr<Recorder> m_recorder;
+
+    std::mutex m_streamLock;
+    std::unique_ptr<Streamer> m_stream;
+    uint64_t m_streamId = 0;
+    std::atomic<uint64_t> m_streamIds{ 0 };
 };
 }
 

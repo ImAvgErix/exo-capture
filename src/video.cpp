@@ -401,7 +401,8 @@ void SetApiBool(ICodecAPI* api, const GUID& key, bool value)
     api->SetValue(&key, &v);
 }
 
-/// The parameter sets (VPS/SPS/PPS) at the head of an Annex B key frame.
+}
+
 std::vector<uint8_t> ParameterSets(const std::vector<uint8_t>& data, Codec codec)
 {
     std::vector<uint8_t> out;
@@ -435,9 +436,8 @@ std::vector<uint8_t> ParameterSets(const std::vector<uint8_t>& data, Codec codec
     }
     return out;
 }
-}
 
-VideoEncoder::VideoEncoder(GpuDevice& gpu, Codec codec, UINT width, UINT height, UINT fps, UINT bitrate, bool hdr,
+VideoEncoder::VideoEncoder(GpuDevice& gpu, Codec codec, UINT width, UINT height, UINT fps, UINT bitrate, bool hdr, bool realtime,
     std::function<void(PacketPtr)> sink)
     : m_gpu(gpu), m_codec(codec), m_fps(fps), m_width(width), m_height(height), m_sink(std::move(sink))
 {
@@ -464,20 +464,36 @@ VideoEncoder::VideoEncoder(GpuDevice& gpu, Codec codec, UINT width, UINT height,
     {
         VARIANT mode{};
         mode.vt = VT_UI4;
-        mode.ulVal = eAVEncCommonRateControlMode_PeakConstrainedVBR;
-        if (FAILED(m_api->SetValue(&CODECAPI_AVEncCommonRateControlMode, &mode)))
+        if (realtime)
         {
-            mode.ulVal = eAVEncCommonRateControlMode_UnconstrainedVBR;
+            // A live stream: the rate the network was promised, with half a second of buffer so a key
+            // frame or a scene cut fits in, and a quality floor. Without the floor a still screen drives
+            // the quantizer to its finest, and the first moving frames after it come out several times
+            // over the rate (a burst, then a dip while the encoder pays it back).
+            mode.ulVal = eAVEncCommonRateControlMode_CBR;
             if (FAILED(m_api->SetValue(&CODECAPI_AVEncCommonRateControlMode, &mode)))
-                SetApi(m_api.get(), CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
+                SetApi(m_api.get(), CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_PeakConstrainedVBR);
+            SetApi(m_api.get(), CODECAPI_AVEncCommonBufferSize, bitrate / 2);
+            SetApi(m_api.get(), CODECAPI_AVEncVideoMinQP, 18);
+        }
+        else
+        {
+            mode.ulVal = eAVEncCommonRateControlMode_PeakConstrainedVBR;
+            if (FAILED(m_api->SetValue(&CODECAPI_AVEncCommonRateControlMode, &mode)))
+            {
+                mode.ulVal = eAVEncCommonRateControlMode_UnconstrainedVBR;
+                if (FAILED(m_api->SetValue(&CODECAPI_AVEncCommonRateControlMode, &mode)))
+                    SetApi(m_api.get(), CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
+            }
         }
         SetApi(m_api.get(), CODECAPI_AVEncCommonMeanBitRate, bitrate);
-        SetApi(m_api.get(), CODECAPI_AVEncCommonMaxBitRate, static_cast<UINT32>(std::min<double>(bitrate * 1.5, 200e6)));
-        SetApi(m_api.get(), CODECAPI_AVEncMPVGOPSize, fps * 2);
+        SetApi(m_api.get(), CODECAPI_AVEncCommonMaxBitRate, static_cast<UINT32>(std::min<double>(bitrate * (realtime ? 1.2 : 1.5), 200e6)));
+        SetApi(m_api.get(), CODECAPI_AVEncMPVGOPSize, fps * (realtime ? 5 : 2));
         SetApi(m_api.get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
         SetApiBool(m_api.get(), CODECAPI_AVLowLatencyMode, true);
-        // Leans to speed: NVENC, AMF and Quick Sync run beside the game's own GPU work.
-        SetApi(m_api.get(), CODECAPI_AVEncCommonQualityVsSpeed, 40);
+        // Leans to speed: NVENC, AMF and Quick Sync run beside the game's own GPU work. A stream's
+        // bit rate is lower than a file's, so it takes a little more care per frame.
+        SetApi(m_api.get(), CODECAPI_AVEncCommonQualityVsSpeed, realtime ? 55 : 40);
     }
 
     com_ptr<IMFMediaType> out;
@@ -719,13 +735,83 @@ GraphicsCaptureItem ItemFor(HWND window, HMONITOR monitor)
         Check(interop->CreateForMonitor(monitor, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(item)), "capture the screen");
     return item;
 }
+
+/// Windows draws a glowing outline around anything being captured, and it lands in the picture.
+/// Turning it off takes borderless access, asked once (no prompt for a desktop app).
+bool Borderless()
+{
+    static const bool allowed = [] {
+        try { return GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless).get() == winrt::Windows::Security::Authorization::AppCapabilityAccess::AppCapabilityAccessStatus::Allowed; }
+        catch (...) { return false; }
+    }();
+    return allowed;
+}
+
+/// The frame's picture, copied to memory the processor reads, as a JPEG.
+std::vector<uint8_t> FrameJpeg(GpuDevice& gpu, Direct3D11CaptureFrame const& frame, UINT maxWidth)
+{
+    auto access = frame.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+    com_ptr<ID3D11Texture2D> texture;
+    Check(access->GetInterface(IID_PPV_ARGS(texture.put())), "frame texture");
+    D3D11_TEXTURE2D_DESC desc{};
+    texture->GetDesc(&desc);
+    auto content = frame.ContentSize();
+    UINT w = std::min<UINT>(std::max(content.Width, 1), desc.Width);
+    UINT h = std::min<UINT>(std::max(content.Height, 1), desc.Height);
+    desc.Width = w;
+    desc.Height = h;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+    com_ptr<ID3D11Texture2D> staging;
+    Check(gpu.device->CreateTexture2D(&desc, nullptr, staging.put()), "picture copy");
+    D3D11_BOX box{ 0, 0, 0, w, h, 1 };
+    gpu.context->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, texture.get(), 0, &box);
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    Check(gpu.context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped), "picture read");
+    std::vector<uint8_t> jpeg;
+    try { jpeg = EncodeJpeg(static_cast<const uint8_t*>(mapped.pData), w, h, mapped.RowPitch, maxWidth); }
+    catch (...) { gpu.context->Unmap(staging.get(), 0); throw; }
+    gpu.context->Unmap(staging.get(), 0);
+    return jpeg;
+}
+}
+
+std::vector<uint8_t> GrabFrame(GpuDevice& gpu, HWND window, HMONITOR monitor, UINT maxWidth)
+{
+    auto item = ItemFor(window, monitor);
+    auto size = item.Size();
+    if (size.Width <= 0 || size.Height <= 0) return {};
+    auto pool = Direct3D11CaptureFramePool::CreateFreeThreaded(gpu.winrt, DirectXPixelFormat::B8G8R8A8UIntNormalized, 1, size);
+    auto session = pool.CreateCaptureSession(item);
+    try { session.IsCursorCaptureEnabled(false); } catch (...) {}
+    if (Borderless()) { try { session.IsBorderRequired(false); } catch (...) {} }
+    // Shared with the handler, which may still be running when this returns.
+    auto ready = std::make_shared<winrt::handle>(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    auto token = pool.FrameArrived([ready](auto&&, auto&&) { SetEvent(ready->get()); });
+    auto close = [&] {
+        pool.FrameArrived(token);
+        try { session.Close(); pool.Close(); } catch (...) {}
+    };
+    std::vector<uint8_t> jpeg;
+    try
+    {
+        session.StartCapture();
+        if (WaitForSingleObject(ready->get(), 1000) == WAIT_OBJECT_0)
+            if (auto frame = pool.TryGetNextFrame()) jpeg = FrameJpeg(gpu, frame, maxWidth);
+    }
+    catch (...) { close(); throw; }
+    close();
+    return jpeg;
 }
 
 CaptureSession::CaptureSession(std::shared_ptr<GpuDevice> gpu, const Options& options, std::function<void(PacketPtr)> sink)
     : m_gpu(std::move(gpu)), m_options(options), m_codec(options.codec)
 {
-    m_fps = std::clamp<UINT>(options.fps, 24, 120);
+    m_fps = std::clamp<UINT>(options.fps, 10, 120);
     m_interval = 10'000'000 / m_fps;
+    m_keyInterval = options.realtime ? 50'000'000 : 10'000'000;
     HMONITOR monitor = options.window ? MonitorFromWindow(options.window, MONITOR_DEFAULTTONEAREST) : options.monitor;
     m_hdr = m_codec != Codec::H264 && MonitorIsHdr(monitor);
     winrt::Windows::Graphics::SizeInt32 size{};
@@ -757,7 +843,13 @@ CaptureSession::CaptureSession(std::shared_ptr<GpuDevice> gpu, const Options& op
     double scale = std::min({ 1.0, maxSide / w, maxSide / h, std::sqrt(3840.0 * 2160.0 / (w * h)) });
     m_width = static_cast<UINT>(w * scale) & ~1u;
     m_height = static_cast<UINT>(h * scale) & ~1u;
-    m_bitrate = BitrateFor(m_codec, m_width, m_height, m_fps, options.quality);
+    // Go Live asks for its own size (the content is fitted in, black around it if the shape differs).
+    if (options.width >= 64 && options.height >= 64)
+    {
+        m_width = std::min<UINT>(options.width, static_cast<UINT>(maxSide)) & ~1u;
+        m_height = std::min<UINT>(options.height, static_cast<UINT>(maxSide)) & ~1u;
+    }
+    m_bitrate = options.bitrate ? options.bitrate : BitrateFor(m_codec, m_width, m_height, m_fps, options.quality);
 
     m_videoDevice = m_gpu->device.as<ID3D11VideoDevice>();
     m_videoContext = m_gpu->context.as<ID3D11VideoContext>();
@@ -768,8 +860,8 @@ CaptureSession::CaptureSession(std::shared_ptr<GpuDevice> gpu, const Options& op
     {
         try
         {
-            m_bitrate = BitrateFor(m_codec, m_width, m_height, m_fps, options.quality);
-            m_encoder = std::make_unique<VideoEncoder>(*m_gpu, m_codec, m_width, m_height, m_fps, m_bitrate, m_hdr, sink);
+            m_bitrate = options.bitrate ? options.bitrate : BitrateFor(m_codec, m_width, m_height, m_fps, options.quality);
+            m_encoder = std::make_unique<VideoEncoder>(*m_gpu, m_codec, m_width, m_height, m_fps, m_bitrate, m_hdr, options.realtime, sink);
             break;
         }
         catch (const std::exception& e)
@@ -817,17 +909,13 @@ void CaptureSession::StartWindows(const Options& options)
     auto pixelFormat = m_hdr ? DirectXPixelFormat::R16G16B16A16Float : DirectXPixelFormat::B8G8R8A8UIntNormalized;
     m_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(m_gpu->winrt, pixelFormat, 2, size);
     m_poolSize = size;
-    // Windows draws a glowing outline around anything being captured, and it lands in the
-    // recording. Turning it off takes borderless access, asked once (no prompt for a desktop app).
-    static const bool borderless = [] {
-        try { return GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless).get() == winrt::Windows::Security::Authorization::AppCapabilityAccess::AppCapabilityAccessStatus::Allowed; }
-        catch (...) { return false; }
-    }();
     m_session = m_pool.CreateCaptureSession(m_item);
     try { m_session.IsCursorCaptureEnabled(options.cursor); } catch (...) {}
-    if (borderless) { try { m_session.IsBorderRequired(false); } catch (...) {} }
+    if (Borderless()) { try { m_session.IsBorderRequired(false); } catch (...) {} }
     // Windows hands over no more frames than the clip keeps: a game drawing faster costs nothing extra.
-    try { m_session.MinUpdateInterval(winrt::Windows::Foundation::TimeSpan(m_interval * 9 / 10)); } catch (...) {}
+    // A stream asks for twice its rate, so every tick of its clock finds a picture newer than the last.
+    const int64_t every = options.realtime ? m_interval / 2 : m_interval * 9 / 10;
+    try { m_session.MinUpdateInterval(winrt::Windows::Foundation::TimeSpan(every)); } catch (...) {}
     m_item.Closed([this](auto&&, auto&&) { m_closed = true; });
     m_pool.FrameArrived([this](Direct3D11CaptureFramePool const& pool, auto&&) {
         try { OnFrame(pool); }
@@ -839,12 +927,14 @@ void CaptureSession::StartWindows(const Options& options)
 
 void CaptureSession::Pump()
 {
-    // The hook sends no signal per frame: take the newest one on the clip's own clock.
+    // The hook sends no signal per frame: take the newest one on the clip's own clock (twice as
+    // often for a stream, whose own clock then picks the newest).
     HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    const int64_t step = m_options.realtime ? m_interval / 2 : m_interval;
     int64_t next = Now100ns();
     while (!m_stop)
     {
-        next += m_interval;
+        next += step;
         int64_t wait = next - Now100ns();
         if (wait < -m_interval) { next = Now100ns(); wait = 0; }
         if (wait > 0)
@@ -912,10 +1002,14 @@ void CaptureSession::OnFrame(Direct3D11CaptureFramePool const& pool)
         pool.Recreate(m_gpu->winrt, m_hdr ? DirectXPixelFormat::R16G16B16A16Float : DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
     }
     int64_t time = frame.SystemRelativeTime().count();
-    // Hold the frame rate: the game may draw faster than the clip records.
-    if (m_lastFrame && time < m_lastFrame - m_interval / 8) return;
-    if (time - m_lastFrame > m_interval) m_lastFrame = time;
-    m_lastFrame += m_interval;
+    // Hold the frame rate: the game may draw faster than the clip records. A stream takes every
+    // picture; its clock picks the newest (Repeat).
+    if (!m_options.realtime)
+    {
+        if (m_lastFrame && time < m_lastFrame - m_interval / 8) return;
+        if (time - m_lastFrame > m_interval) m_lastFrame = time;
+        m_lastFrame += m_interval;
+    }
 
     auto access = frame.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
     com_ptr<ID3D11Texture2D> texture;
@@ -1079,13 +1173,26 @@ void CaptureSession::Convert(int64_t time, ID3D11VideoProcessorInputView* input)
     }
     m_lastIndex = index;
     m_lastDest = dest;
+    if (m_options.realtime)
+    {
+        // A stream sends on its own clock: this picture waits for the next tick, and one that waited
+        // and is already overtaken goes back unused.
+        if (m_pending >= 0)
+        {
+            std::lock_guard lock(*m_freeLock);
+            m_free->push_back(m_pending);
+        }
+        m_pending = index;
+        return;
+    }
     Submit(index, time);
 }
 
 void CaptureSession::Submit(int index, int64_t time)
 {
-    // A key frame every second: clips and trims start within a second of where asked.
-    if (time - m_lastKey >= 10'000'000)
+    // A key frame every second: clips and trims start within a second of where asked. A stream
+    // gets one every five (and whenever Discord asks).
+    if (time - m_lastKey >= m_keyInterval)
     {
         m_encoder->ForceKeyFrame();
         m_lastKey = time;
@@ -1102,30 +1209,59 @@ void CaptureSession::Submit(int index, int64_t time)
 
 void CaptureSession::Repeat()
 {
-    // A still picture sends no frames; repeat the last one ten times a second so
-    // key frames keep coming and the sound stays in step.
+    // A still picture sends no frames. For a clip the last one is repeated ten times a second, so key
+    // frames keep coming and the sound stays in step. Go Live runs on its own clock instead: a frame
+    // exactly every 1/30 or 1/60 s, each the newest picture (a new one when the screen changed, the
+    // last one again when it did not), so viewers get a steady rate, never one that drifts with the
+    // monitor's or the game's.
+    const bool live = m_options.realtime;
+    const int64_t step = live ? m_interval : 500'000;
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    int64_t next = Now100ns();
     while (!m_stop)
     {
-        Sleep(50);
+        next += step;
+        int64_t wait = next - Now100ns();
+        // Fallen behind by more than a frame (the PC stalled): start the beat again from now.
+        if (wait < -m_interval) { next = Now100ns(); wait = 0; }
+        if (wait > 0)
+        {
+            LARGE_INTEGER due{};
+            due.QuadPart = -wait;
+            if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, 1000);
+            else Sleep(static_cast<DWORD>(std::max<int64_t>(1, wait / 10'000)));
+        }
+        if (m_stop) break;
         std::lock_guard lock(m_convert);
         if (m_closed || m_lastIndex < 0) continue;
-        int64_t now = Now100ns();
-        if (now - m_lastSubmit <= 1'000'000) continue;
-        int index = -1;
+        const int64_t time = std::max(live ? next : Now100ns(), m_lastSubmit + 1);
+        try
         {
-            std::lock_guard free(*m_freeLock);
-            if (!m_free->empty()) { index = m_free->back(); m_free->pop_back(); }
+            if (live && m_pending >= 0)
+            {
+                int index = m_pending;
+                m_pending = -1;
+                Submit(index, time);
+                continue;
+            }
+            if (!live && time - m_lastSubmit <= 1'000'000) continue;
+            int index = -1;
+            {
+                std::lock_guard free(*m_freeLock);
+                if (!m_free->empty()) { index = m_free->back(); m_free->pop_back(); }
+            }
+            if (index < 0) { ++m_dropped; continue; }
+            // The newest picture again: no new frame means nothing on screen changed.
+            if (index != m_lastIndex) m_gpu->context->CopyResource(m_targets[index].texture.get(), m_targets[m_lastIndex].texture.get());
+            m_lastIndex = index;
+            Submit(index, time);
         }
-        if (index < 0) continue;
-        // The newest picture again: no new frame means nothing on screen changed.
-        if (index != m_lastIndex) m_gpu->context->CopyResource(m_targets[index].texture.get(), m_targets[m_lastIndex].texture.get());
-        m_lastIndex = index;
-        try { Submit(index, std::max(now, m_lastSubmit + 1)); }
         catch (const std::exception& e) { Log(std::string("Repeat frame: ") + e.what()); }
     }
+    if (timer) CloseHandle(timer);
 }
 
-bool CaptureSession::LastFrame(std::vector<uint8_t>& pixels, UINT& width, UINT& height)
+bool CaptureSession::LastFrame(std::vector<uint8_t>& pixels, UINT& width, UINT& height, UINT maxWidth)
 {
     // Only the copy holds the converter: the read back waits on the GPU, and frames keep coming.
     D3D11_TEXTURE2D_DESC desc{};
@@ -1145,10 +1281,10 @@ bool CaptureSession::LastFrame(std::vector<uint8_t>& pixels, UINT& width, UINT& 
     }
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (FAILED(m_gpu->context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
-    // The newest converted (NV12) frame's picture area as BGRA, sampled to at most 480 across:
-    // it only becomes a thumbnail, which is 480 wide.
+    // The newest converted (NV12) frame's picture area as BGRA, sampled to at most maxWidth across:
+    // it only becomes a thumbnail or a preview.
     UINT fullW = static_cast<UINT>(r.right - r.left), fullH = static_cast<UINT>(r.bottom - r.top);
-    UINT step = std::max(1u, (fullW + 479) / 480);
+    UINT step = std::max(1u, (fullW + maxWidth - 1) / std::max(1u, maxWidth));
     width = fullW / step;
     height = fullH / step;
     pixels.resize(static_cast<size_t>(width) * height * 4);

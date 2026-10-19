@@ -138,10 +138,12 @@ bool GetBool(const json::JsonObject& o, const wchar_t* key, bool fallback)
     return v.ValueType() == json::JsonValueType::Boolean ? v.GetBoolean() : fallback;
 }
 
-void SaveImage(const std::wstring& path, const uint8_t* bgra, UINT width, UINT height, UINT stride, bool png, UINT maxWidth)
+namespace
 {
-    com_ptr<IWICImagingFactory> wic;
-    Check(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(wic.put())), "WIC factory");
+/// Writes BGRA pixels into a WIC stream as JPEG or PNG, scaled down to maxWidth when wider.
+void WriteImage(IWICImagingFactory* wic, IWICStream* stream, const uint8_t* bgra, UINT width, UINT height, UINT stride,
+    bool png, UINT maxWidth, float quality)
+{
     com_ptr<IWICBitmap> bitmap;
     Check(wic->CreateBitmapFromMemory(width, height, GUID_WICPixelFormat32bppBGRA, stride, stride * height,
         const_cast<BYTE*>(bgra), bitmap.put()), "WIC bitmap");
@@ -156,48 +158,99 @@ void SaveImage(const std::wstring& path, const uint8_t* bgra, UINT width, UINT h
         Check(scaler->Initialize(bitmap.get(), outW, outH, WICBitmapInterpolationModeFant), "WIC scale");
         source = scaler;
     }
-    std::wstring temp = path + L".part";
-    com_ptr<IWICStream> stream;
-    Check(wic->CreateStream(stream.put()), "WIC stream");
-    Check(stream->InitializeFromFilename(temp.c_str(), GENERIC_WRITE), "image file");
+    com_ptr<IWICBitmapEncoder> encoder;
+    Check(wic->CreateEncoder(png ? GUID_ContainerFormatPng : GUID_ContainerFormatJpeg, nullptr, encoder.put()), "image encoder");
+    Check(encoder->Initialize(stream, WICBitmapEncoderNoCache), "image encoder init");
+    com_ptr<IWICBitmapFrameEncode> frame;
+    com_ptr<IPropertyBag2> props;
+    Check(encoder->CreateNewFrame(frame.put(), props.put()), "image frame");
+    if (!png && props)
     {
-        com_ptr<IWICBitmapEncoder> encoder;
-        Check(wic->CreateEncoder(png ? GUID_ContainerFormatPng : GUID_ContainerFormatJpeg, nullptr, encoder.put()), "image encoder");
-        Check(encoder->Initialize(stream.get(), WICBitmapEncoderNoCache), "image encoder init");
-        com_ptr<IWICBitmapFrameEncode> frame;
-        com_ptr<IPropertyBag2> props;
-        Check(encoder->CreateNewFrame(frame.put(), props.put()), "image frame");
-        if (!png && props)
-        {
-            PROPBAG2 option{};
-            option.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
-            VARIANT value{};
-            value.vt = VT_R4;
-            value.fltVal = 0.85f;
-            props->Write(1, &option, &value);
-        }
-        Check(frame->Initialize(props.get()), "image frame init");
-        Check(frame->SetSize(outW, outH), "image size");
-        WICPixelFormatGUID format = png ? GUID_WICPixelFormat32bppBGRA : GUID_WICPixelFormat24bppBGR;
-        Check(frame->SetPixelFormat(&format), "image format");
-        com_ptr<IWICBitmapSource> converted = source;
-        if (format != GUID_WICPixelFormat32bppBGRA)
-        {
-            com_ptr<IWICFormatConverter> converter;
-            Check(wic->CreateFormatConverter(converter.put()), "WIC converter");
-            Check(converter->Initialize(source.get(), format, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom), "WIC convert");
-            converted = converter;
-        }
-        Check(frame->WriteSource(converted.get(), nullptr), "image write");
-        Check(frame->Commit(), "image commit");
-        Check(encoder->Commit(), "image file commit");
+        PROPBAG2 option{};
+        option.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
+        VARIANT value{};
+        value.vt = VT_R4;
+        value.fltVal = quality;
+        props->Write(1, &option, &value);
     }
-    stream = nullptr;
+    Check(frame->Initialize(props.get()), "image frame init");
+    Check(frame->SetSize(outW, outH), "image size");
+    WICPixelFormatGUID format = png ? GUID_WICPixelFormat32bppBGRA : GUID_WICPixelFormat24bppBGR;
+    Check(frame->SetPixelFormat(&format), "image format");
+    com_ptr<IWICBitmapSource> converted = source;
+    if (format != GUID_WICPixelFormat32bppBGRA)
+    {
+        com_ptr<IWICFormatConverter> converter;
+        Check(wic->CreateFormatConverter(converter.put()), "WIC converter");
+        Check(converter->Initialize(source.get(), format, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom), "WIC convert");
+        converted = converter;
+    }
+    Check(frame->WriteSource(converted.get(), nullptr), "image write");
+    Check(frame->Commit(), "image commit");
+    Check(encoder->Commit(), "image file commit");
+}
+
+com_ptr<IWICImagingFactory> Wic()
+{
+    com_ptr<IWICImagingFactory> wic;
+    Check(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(wic.put())), "WIC factory");
+    return wic;
+}
+}
+
+void SaveImage(const std::wstring& path, const uint8_t* bgra, UINT width, UINT height, UINT stride, bool png, UINT maxWidth)
+{
+    auto wic = Wic();
+    std::wstring temp = path + L".part";
+    {
+        com_ptr<IWICStream> stream;
+        Check(wic->CreateStream(stream.put()), "WIC stream");
+        Check(stream->InitializeFromFilename(temp.c_str(), GENERIC_WRITE), "image file");
+        WriteImage(wic.get(), stream.get(), bgra, width, height, stride, png, maxWidth, 0.85f);
+    }
     if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
     {
         DeleteFileW(temp.c_str());
         throw Failure(HRESULT_FROM_WIN32(GetLastError()), "image rename");
     }
+}
+
+std::vector<uint8_t> EncodeJpeg(const uint8_t* bgra, UINT width, UINT height, UINT stride, UINT maxWidth, float quality)
+{
+    auto wic = Wic();
+    com_ptr<IStream> memory;
+    Check(CreateStreamOnHGlobal(nullptr, TRUE, memory.put()), "image memory");
+    com_ptr<IWICStream> stream;
+    Check(wic->CreateStream(stream.put()), "WIC stream");
+    Check(stream->InitializeFromIStream(memory.get()), "image memory stream");
+    WriteImage(wic.get(), stream.get(), bgra, width, height, stride, false, maxWidth, quality);
+    STATSTG stat{};
+    Check(memory->Stat(&stat, STATFLAG_NONAME), "image size");
+    std::vector<uint8_t> out(static_cast<size_t>(stat.cbSize.QuadPart));
+    LARGE_INTEGER start{};
+    Check(memory->Seek(start, STREAM_SEEK_SET, nullptr), "image rewind");
+    ULONG read = 0;
+    Check(memory->Read(out.data(), static_cast<ULONG>(out.size()), &read), "image read");
+    out.resize(read);
+    return out;
+}
+
+std::wstring Base64(const std::vector<uint8_t>& bytes)
+{
+    static const wchar_t digits[] = L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::wstring out;
+    out.reserve((bytes.size() + 2) / 3 * 4);
+    for (size_t i = 0; i < bytes.size(); i += 3)
+    {
+        uint32_t n = static_cast<uint32_t>(bytes[i]) << 16;
+        if (i + 1 < bytes.size()) n |= static_cast<uint32_t>(bytes[i + 1]) << 8;
+        if (i + 2 < bytes.size()) n |= bytes[i + 2];
+        out += digits[(n >> 18) & 63];
+        out += digits[(n >> 12) & 63];
+        out += i + 1 < bytes.size() ? digits[(n >> 6) & 63] : L'=';
+        out += i + 2 < bytes.size() ? digits[n & 63] : L'=';
+    }
+    return out;
 }
 
 bool ReadImageFile(const std::wstring& path, std::vector<uint8_t>& pixels, UINT& width, UINT& height)

@@ -82,6 +82,10 @@ bool GetBool(const json::JsonObject& o, const wchar_t* key, bool fallback);
 
 /// Saves BGRA pixels as JPEG (thumbnails) or PNG (snips) with WIC.
 void SaveImage(const std::wstring& path, const uint8_t* bgra, UINT width, UINT height, UINT stride, bool png, UINT maxWidth = 0);
+/// BGRA pixels as JPEG bytes in memory, scaled down to maxWidth when wider (Go Live's picker and preview).
+std::vector<uint8_t> EncodeJpeg(const uint8_t* bgra, UINT width, UINT height, UINT stride, UINT maxWidth, float quality = 0.8f);
+/// Bytes as base64, for a JSON reply.
+std::wstring Base64(const std::vector<uint8_t>& bytes);
 
 /// Reads an image file as BGRA pixels (top-down).
 bool ReadImageFile(const std::wstring& path, std::vector<uint8_t>& pixels, UINT& width, UINT& height);
