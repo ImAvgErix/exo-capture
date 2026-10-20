@@ -312,6 +312,8 @@ struct SnipWin : Win
     {
         switch (msg)
         {
+        case WM_ERASEBKGND:
+            return 1; // the frozen screen covers it all; erasing to black would flash
         case WM_PAINT:
         {
             PAINTSTRUCT ps;
@@ -684,7 +686,15 @@ void Ui::Snip(std::function<void(std::optional<SnipResult>)> done)
         POINT p;
         GetCursorPos(&p);
         win->selection = win->WindowAt({ p.x - vx, p.y - vy });
+        // Out of sight until its first frame (the frozen screen) is drawn: shown first, the window's own black
+        // background would flash over every screen for a frame.
+        BOOL cloak = TRUE;
+        DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
         ShowWindow(hwnd, SW_SHOW);
+        UpdateWindow(hwnd);
+        DwmFlush();
+        cloak = FALSE;
+        DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
         SetForegroundWindow(hwnd);
         SetFocus(hwnd);
     });

@@ -479,12 +479,14 @@ private:
             CloseHandle(pipe);
             throw std::runtime_error("That window or screen is gone.");
         }
-        options.fps = static_cast<UINT>(std::clamp(GetNumber(p, L"fps", 30), 10.0, 60.0));
+        // Up to 120 fps, never faster than the screen it comes from (a faster rate would only repeat frames).
+        options.fps = static_cast<UINT>(std::clamp(GetNumber(p, L"fps", 30), 10.0, 120.0));
+        options.fps = std::min<UINT>(options.fps, std::max<UINT>(30, RefreshRate(options.window ? MonitorFromWindow(options.window, MONITOR_DEFAULTTONEAREST) : options.monitor)));
         options.codec = Codec::H264;
         options.cursor = GetBool(p, L"cursor", true);
         options.width = static_cast<UINT>(std::clamp(GetNumber(p, L"width", 0), 0.0, 4096.0));
         options.height = static_cast<UINT>(std::clamp(GetNumber(p, L"height", 0), 0.0, 4096.0));
-        options.bitrate = static_cast<UINT>(std::clamp(GetNumber(p, L"bitrate", 6e6), 5e5, 5e7));
+        options.bitrate = static_cast<UINT>(std::clamp(GetNumber(p, L"bitrate", 6e6), 5e5, 6e7));
         options.realtime = true;
         StopStream(0, {}, false);
         auto id = ++m_streamIds;
