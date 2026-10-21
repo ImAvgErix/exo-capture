@@ -855,20 +855,41 @@ CaptureSession::CaptureSession(std::shared_ptr<GpuDevice> gpu, const Options& op
     m_videoContext = m_gpu->context.as<ID3D11VideoContext>();
 
     // A driver can list an encoder that then refuses this size or HDR: step down, HDR before SDR,
-    // AV1 to HEVC to H.264 (which carries no HDR), until one starts.
+    // AV1 to HEVC to H.264 (which carries no HDR), then H.264 at 60 and 30 fps and at most 1080p
+    // (an encoder's limit is pixels a second, and some cards' is lower than the screen's), until one starts.
+    UINT rate = options.bitrate;
     for (;;)
     {
         try
         {
-            m_bitrate = options.bitrate ? options.bitrate : BitrateFor(m_codec, m_width, m_height, m_fps, options.quality);
+            m_bitrate = rate ? rate : BitrateFor(m_codec, m_width, m_height, m_fps, options.quality);
             m_encoder = std::make_unique<VideoEncoder>(*m_gpu, m_codec, m_width, m_height, m_fps, m_bitrate, m_hdr, options.realtime, sink);
             break;
         }
         catch (const std::exception& e)
         {
-            Log(std::string("Encoder ") + Narrow(CodecName(m_codec)) + (m_hdr ? " HDR" : "") + " failed: " + e.what());
+            Log(std::string("Encoder ") + Narrow(CodecName(m_codec)) + (m_hdr ? " HDR " : " ") + std::to_string(m_width) + "x" +
+                std::to_string(m_height) + " @" + std::to_string(m_fps) + " failed: " + e.what());
             if (m_hdr) m_hdr = false;
-            else if (m_codec == Codec::H264) throw;
+            else if (m_codec == Codec::H264)
+            {
+                // No encoder at all is not a matter of settings.
+                auto failure = dynamic_cast<const Failure*>(&e);
+                if (failure && failure->hr == MF_E_TOPO_CODEC_NOT_FOUND) throw;
+                double before = static_cast<double>(m_width) * m_height * m_fps;
+                if (m_fps > 60) m_fps = 60;
+                else if (m_fps > 30) m_fps = 30;
+                else if (static_cast<double>(m_width) * m_height > 1920.0 * 1080.0)
+                {
+                    double fit = std::min(1920.0 / std::max(m_width, m_height), 1080.0 / std::min(m_width, m_height));
+                    m_width = static_cast<UINT>(m_width * fit) & ~1u;
+                    m_height = static_cast<UINT>(m_height * fit) & ~1u;
+                }
+                else throw;
+                m_interval = 10'000'000 / m_fps;
+                // A rate asked for (Go Live's) was for the bigger picture: it scales down with it.
+                if (rate) rate = static_cast<UINT>(std::max(1e6, rate * static_cast<double>(m_width) * m_height * m_fps / before));
+            }
             else
             {
                 m_codec = m_codec == Codec::AV1 && options.hevcFallback ? Codec::HEVC : Codec::H264;
