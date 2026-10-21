@@ -438,12 +438,18 @@ std::vector<uint8_t> ParameterSets(const std::vector<uint8_t>& data, Codec codec
 }
 
 VideoEncoder::VideoEncoder(GpuDevice& gpu, Codec codec, UINT width, UINT height, UINT fps, UINT bitrate, bool hdr, bool realtime,
-    std::function<void(PacketPtr)> sink)
-    : m_gpu(gpu), m_codec(codec), m_fps(fps), m_width(width), m_height(height), m_sink(std::move(sink))
+    std::function<void(PacketPtr)> sink, bool software)
+    : m_gpu(gpu), m_codec(codec), m_fps(fps), m_width(width), m_height(height), m_sink(std::move(sink)), m_sync(software)
 {
     const GUID input = hdr ? MFVideoFormat_P010 : MFVideoFormat_NV12;
     com_ptr<IMFActivate> activate;
-    if (!FindMft(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, input, Subtype(codec),
+    if (software)
+    {
+        if (!FindMft(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER, input, Subtype(codec),
+            nullptr, &m_name, &activate))
+            throw Failure(MF_E_TOPO_CODEC_NOT_FOUND, "no software video encoder");
+    }
+    else if (!FindMft(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, input, Subtype(codec),
         &gpu.luid, &m_name, &activate) &&
         !FindMft(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER, input, Subtype(codec),
         nullptr, &m_name, &activate))
@@ -456,7 +462,7 @@ VideoEncoder::VideoEncoder(GpuDevice& gpu, Codec codec, UINT width, UINT height,
         attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
         attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
     }
-    Check(m_mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(gpu.manager.get())), "encoder GPU");
+    if (!m_sync) Check(m_mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(gpu.manager.get())), "encoder GPU");
     if (m_mft->GetStreamIDs(1, &m_in, 1, &m_out) != S_OK) { m_in = 0; m_out = 0; }
 
     m_api = m_mft.as<ICodecAPI>();
@@ -544,11 +550,12 @@ VideoEncoder::VideoEncoder(GpuDevice& gpu, Codec codec, UINT width, UINT height,
     in->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     Check(m_mft->SetInputType(m_in, in.get(), 0), "encoder input type");
 
-    m_events = m_mft.as<IMFMediaEventGenerator>();
+    if (!m_sync) m_events = m_mft.as<IMFMediaEventGenerator>();
     m_mft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
     Check(m_mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0), "encoder start");
     Check(m_mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0), "encoder stream start");
-    m_thread = std::thread([this] { EventLoop(); });
+    if (!m_sync) m_thread = std::thread([this] { EventLoop(); });
+    else Log("Encoder: " + Narrow(m_name) + " on the CPU (the graphics card's would not start)");
 }
 
 VideoEncoder::~VideoEncoder()
@@ -559,17 +566,25 @@ VideoEncoder::~VideoEncoder()
     }
     m_mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, m_in);
     m_mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, m_in);
+    if (!m_sync)
     {
         std::unique_lock lock(m_lock);
         m_changed.wait_for(lock, std::chrono::seconds(2), [this] { return m_drained; });
     }
     if (auto shutdown = m_mft.try_as<IMFShutdown>()) shutdown->Shutdown();
     if (m_thread.joinable()) m_thread.join();
-    m_mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
+    if (!m_sync) m_mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
 }
 
 void VideoEncoder::Submit(ID3D11Texture2D* texture, int64_t time, std::function<void()> released)
 {
+    if (m_sync)
+    {
+        try { SubmitSync(texture, time); }
+        catch (const std::exception& e) { Log(std::string("CPU encoder: ") + e.what()); }
+        if (released) released();
+        return;
+    }
     com_ptr<IMFMediaBuffer> buffer;
     Check(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), texture, 0, FALSE, buffer.put()), "frame buffer");
     if (auto twoD = buffer.try_as<IMF2DBuffer>())
@@ -591,6 +606,58 @@ void VideoEncoder::Submit(ID3D11Texture2D* texture, int64_t time, std::function<
     // The encoder fell behind: drop the oldest waiting frame rather than grow.
     while (m_queue.size() > 3) m_queue.pop_front();
     FeedLocked();
+}
+
+// The CPU encoder takes the frame from memory: copied off the GPU (NV12, its chroma plane below the luma rows), encoded
+// on this thread, and every packet it has ready taken at once.
+void VideoEncoder::SubmitSync(ID3D11Texture2D* texture, int64_t time)
+{
+    D3D11_TEXTURE2D_DESC desc{};
+    texture->GetDesc(&desc);
+    if (!m_staging)
+    {
+        auto staging = desc;
+        staging.Usage = D3D11_USAGE_STAGING;
+        staging.BindFlags = 0;
+        staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        staging.MiscFlags = 0;
+        staging.MipLevels = 1;
+        staging.ArraySize = 1;
+        Check(m_gpu.device->CreateTexture2D(&staging, nullptr, m_staging.put()), "frame copy for the CPU encoder");
+    }
+    m_gpu.context->CopyResource(m_staging.get(), texture);
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    Check(m_gpu.context->Map(m_staging.get(), 0, D3D11_MAP_READ, 0, &mapped), "frame read for the CPU encoder");
+    const UINT w = m_width, h = m_height, size = w * h * 3 / 2;
+    com_ptr<IMFMediaBuffer> buffer;
+    HRESULT made = MFCreateMemoryBuffer(size, buffer.put());
+    BYTE* out = nullptr;
+    if (SUCCEEDED(made) && SUCCEEDED(buffer->Lock(&out, nullptr, nullptr)))
+    {
+        auto src = static_cast<const BYTE*>(mapped.pData);
+        for (UINT y = 0; y < h; ++y) memcpy(out + static_cast<size_t>(y) * w, src + static_cast<size_t>(y) * mapped.RowPitch, w);
+        auto uv = src + static_cast<size_t>(mapped.RowPitch) * desc.Height;
+        for (UINT y = 0; y < h / 2; ++y)
+            memcpy(out + static_cast<size_t>(w) * h + static_cast<size_t>(y) * w, uv + static_cast<size_t>(y) * mapped.RowPitch, w);
+        buffer->Unlock();
+        buffer->SetCurrentLength(size);
+    }
+    m_gpu.context->Unmap(m_staging.get(), 0);
+    Check(made, "frame buffer");
+    com_ptr<IMFSample> sample;
+    Check(MFCreateSample(sample.put()), "frame sample");
+    sample->AddBuffer(buffer.get());
+    sample->SetSampleTime(time);
+    sample->SetSampleDuration(10'000'000 / m_fps);
+    if (m_forceKey.exchange(false) && m_api) SetApi(m_api.get(), CODECAPI_AVEncVideoForceKeyFrame, 1);
+    HRESULT hr = m_mft->ProcessInput(m_in, sample.get(), 0);
+    if (hr == MF_E_NOTACCEPTING)
+    {
+        while (TakeOutput()) {}
+        hr = m_mft->ProcessInput(m_in, sample.get(), 0);
+    }
+    if (FAILED(hr)) Log("CPU encoder refused a frame: " + std::string(Failure(hr, "ProcessInput").what()));
+    while (TakeOutput()) {}
 }
 
 void VideoEncoder::FeedLocked()
@@ -639,7 +706,7 @@ void VideoEncoder::EventLoop()
     }
 }
 
-void VideoEncoder::TakeOutput()
+bool VideoEncoder::TakeOutput()
 {
     MFT_OUTPUT_STREAM_INFO info{};
     m_mft->GetOutputStreamInfo(m_out, &info);
@@ -664,11 +731,11 @@ void VideoEncoder::TakeOutput()
     {
         com_ptr<IMFMediaType> type;
         if (SUCCEEDED(m_mft->GetOutputAvailableType(m_out, 0, type.put()))) m_mft->SetOutputType(m_out, type.get(), 0);
-        return;
+        return true;
     }
-    if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return;
+    if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return false;
     Check(hr, "encode");
-    if (!sample) return;
+    if (!sample) return false;
 
     auto packet = std::make_shared<Packet>();
     packet->track = 0;
@@ -712,6 +779,7 @@ void VideoEncoder::TakeOutput()
         m_changed.notify_all();
     }
     if (m_sink) m_sink(packet);
+    return true;
 }
 
 com_ptr<IMFMediaType> VideoEncoder::OutputType()
@@ -858,12 +926,23 @@ CaptureSession::CaptureSession(std::shared_ptr<GpuDevice> gpu, const Options& op
     // AV1 to HEVC to H.264 (which carries no HDR), then H.264 at 60 and 30 fps and at most 1080p
     // (an encoder's limit is pixels a second, and some cards' is lower than the screen's), until one starts.
     UINT rate = options.bitrate;
+    // A check of the CPU encoder on a PC whose graphics card's works (EXO_CAPTURE_CPU in Exo's environment): Go Live
+    // starts on it, as it would after the card's refused.
+    if (options.realtime && GetEnvironmentVariableW(L"EXO_CAPTURE_CPU", nullptr, 0) > 0)
+    {
+        m_software = true;
+        m_fps = std::min<UINT>(m_fps, 30);
+        double f = std::min({ 1.0, 1280.0 / std::max(m_width, m_height), 720.0 / std::min(m_width, m_height) });
+        m_width = static_cast<UINT>(m_width * f) & ~1u;
+        m_height = static_cast<UINT>(m_height * f) & ~1u;
+        m_interval = 10'000'000 / m_fps;
+    }
     for (;;)
     {
         try
         {
             m_bitrate = rate ? rate : BitrateFor(m_codec, m_width, m_height, m_fps, options.quality);
-            m_encoder = std::make_unique<VideoEncoder>(*m_gpu, m_codec, m_width, m_height, m_fps, m_bitrate, m_hdr, options.realtime, sink);
+            m_encoder = std::make_unique<VideoEncoder>(*m_gpu, m_codec, m_width, m_height, m_fps, m_bitrate, m_hdr, options.realtime, sink, m_software);
             break;
         }
         catch (const std::exception& e)
@@ -875,15 +954,23 @@ CaptureSession::CaptureSession(std::shared_ptr<GpuDevice> gpu, const Options& op
             {
                 // No encoder at all is not a matter of settings.
                 auto failure = dynamic_cast<const Failure*>(&e);
-                if (failure && failure->hr == MF_E_TOPO_CODEC_NOT_FOUND) throw;
+                bool none = failure && failure->hr == MF_E_TOPO_CODEC_NOT_FOUND;
                 double before = static_cast<double>(m_width) * m_height * m_fps;
-                if (m_fps > 60) m_fps = 60;
-                else if (m_fps > 30) m_fps = 30;
-                else if (static_cast<double>(m_width) * m_height > 1920.0 * 1080.0)
+                auto fit = [this](double w, double h) {
+                    double f = std::min(w / std::max(m_width, m_height), h / std::min(m_width, m_height));
+                    m_width = static_cast<UINT>(m_width * f) & ~1u;
+                    m_height = static_cast<UINT>(m_height * f) & ~1u;
+                };
+                if (!m_software && !none && m_fps > 60) m_fps = 60;
+                else if (!m_software && !none && m_fps > 30) m_fps = 30;
+                else if (!m_software && !none && static_cast<double>(m_width) * m_height > 1920.0 * 1080.0) fit(1920.0, 1080.0);
+                else if (!m_software && options.realtime)
                 {
-                    double fit = std::min(1920.0 / std::max(m_width, m_height), 1080.0 / std::min(m_width, m_height));
-                    m_width = static_cast<UINT>(m_width * fit) & ~1u;
-                    m_height = static_cast<UINT>(m_height * fit) & ~1u;
+                    // The graphics card's encoder won't start at all (another GPU's, none, or refused): Go Live on
+                    // Windows' own H.264 encoder, on the CPU, at most 720p 30 so it keeps up, rather than not at all.
+                    m_software = true;
+                    m_fps = std::min<UINT>(m_fps, 30);
+                    if (static_cast<double>(m_width) * m_height > 1280.0 * 720.0) fit(1280.0, 720.0);
                 }
                 else throw;
                 m_interval = 10'000'000 / m_fps;

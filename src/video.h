@@ -43,8 +43,9 @@ class VideoEncoder
 public:
     /// realtime: a live stream (Go Live) at a constant rate the network carries, a key frame every
     /// five seconds; else a file's quality-led rate, a key frame every two.
+    /// software: Windows' own H.264 encoder on the CPU (Go Live when the graphics card's won't start), fed from memory.
     VideoEncoder(GpuDevice& gpu, Codec codec, UINT width, UINT height, UINT fps, UINT bitrate, bool hdr, bool realtime,
-        std::function<void(PacketPtr)> sink);
+        std::function<void(PacketPtr)> sink, bool software = false);
     ~VideoEncoder();
     /// Queues one NV12/P010 texture; released() runs once the encoder no longer reads it.
     void Submit(ID3D11Texture2D* texture, int64_t time, std::function<void()> released);
@@ -55,7 +56,8 @@ public:
 private:
     void EventLoop();
     void FeedLocked();
-    void TakeOutput();
+    bool TakeOutput();
+    void SubmitSync(ID3D11Texture2D* texture, int64_t time);
 
     GpuDevice& m_gpu;
     Codec m_codec;
@@ -76,6 +78,8 @@ private:
     bool m_drained = false;
     com_ptr<IMFMediaType> m_outputType;
     std::thread m_thread;
+    bool m_sync = false; // the CPU encoder: no events, each frame in and its output out on the caller's thread
+    com_ptr<ID3D11Texture2D> m_staging;
 };
 
 /// Captures one window or monitor with Windows.Graphics.Capture (no injection), converts each
@@ -143,6 +147,7 @@ private:
     Codec m_codec;
     UINT m_width = 0, m_height = 0, m_fps = 60, m_bitrate = 0;
     bool m_hdr = false;
+    bool m_software = false;
     int64_t m_interval = 166'667;
     int64_t m_keyInterval = 10'000'000;
 
